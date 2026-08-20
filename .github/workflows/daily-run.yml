@@ -1,0 +1,33 @@
+name: Daily insider alert scan
+
+on:
+  schedule:
+    # 15:00 US/Eastern = 19:00 UTC during EDT (roughly Mar-Nov), 20:00 UTC during EST.
+    # Adjust to your own timezone: convert your local 3:00 PM to UTC and edit the line below.
+    - cron: "0 19 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab, for testing
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore seen-alerts state
+        uses: actions/cache@v4
+        with:
+          path: state/seen_alerts.json
+          key: seen-alerts-${{ github.run_id }}
+          restore-keys: seen-alerts-
+
+      - run: python main.py
+        env:
+          EDGAR_IDENTITY: ${{ secrets.EDGAR_IDENTITY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
