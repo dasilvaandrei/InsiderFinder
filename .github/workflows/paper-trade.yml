@@ -1,0 +1,47 @@
+name: Paper trading strategy test
+
+on:
+  schedule:
+    # Checks in 4x/day, approximating market open / 12pm / 3pm / close US/Eastern (EDT).
+    # Same UTC/DST caveat as daily-run.yml — these lines shift by 1 hour for EST months.
+    - cron: "35 13 * * 1-5"   # ~9:35am ET (open)
+    - cron: "0 16 * * 1-5"    # 12:00pm ET
+    - cron: "0 19 * * 1-5"    # 3:00pm ET
+    - cron: "50 19 * * 1-5"   # ~3:50pm ET (near close)
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore paper trading portfolio
+        uses: actions/cache@v4
+        with:
+          path: paper_trading/portfolio.json
+          key: paper-portfolio-${{ github.run_id }}
+          restore-keys: paper-portfolio-
+
+      - name: Determine which daily check-in this is
+        id: label
+        run: |
+          case "${{ github.event.schedule }}" in
+            "35 13 * * 1-5") echo "value=open" >> "$GITHUB_OUTPUT" ;;
+            "0 16 * * 1-5") echo "value=noon" >> "$GITHUB_OUTPUT" ;;
+            "0 19 * * 1-5") echo "value=3pm" >> "$GITHUB_OUTPUT" ;;
+            "50 19 * * 1-5") echo "value=close" >> "$GITHUB_OUTPUT" ;;
+            *) echo "value=close" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - run: python paper_trade.py --label ${{ steps.label.outputs.value }}
+        env:
+          EDGAR_IDENTITY: ${{ secrets.EDGAR_IDENTITY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

@@ -8,3 +8,4 @@ state/seen_alerts.json
 backtest/signals.db
 backtest/cache/
 backtest/reports/*.csv
+paper_trading/portfolio.json

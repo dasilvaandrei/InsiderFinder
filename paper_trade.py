@@ -1,0 +1,231 @@
+import argparse
+import json
+import logging
+import os
+from datetime import date, datetime, timedelta
+
+import requests
+import yfinance as yf
+
+import config
+import rating
+from sources import congress_trades, sec_insiders
+
+logger = logging.getLogger(__name__)
+
+PORTFOLIO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trading", "portfolio.json")
+STARTING_CASH = 2000.0
+POSITION_SIZE = 400.0
+TEST_LENGTH_DAYS = 7
+TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
+
+_TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+
+
+def _send_telegram(text: str) -> None:
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        return
+    try:
+        response = requests.post(
+            _TELEGRAM_API_URL.format(token=config.TELEGRAM_BOT_TOKEN),
+            json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        logger.exception("Failed to send paper-trade Telegram message")
+
+
+def _load_portfolio() -> dict:
+    if not os.path.exists(PORTFOLIO_PATH):
+        return {
+            "starting_cash": STARTING_CASH,
+            "cash": STARTING_CASH,
+            "position_size": POSITION_SIZE,
+            "started_at": date.today().isoformat(),
+            "considered_keys": [],
+            "open_positions": [],
+            "closed_trades": [],
+        }
+    with open(PORTFOLIO_PATH) as f:
+        return json.load(f)
+
+
+def _save_portfolio(portfolio: dict) -> None:
+    os.makedirs(os.path.dirname(PORTFOLIO_PATH), exist_ok=True)
+    with open(PORTFOLIO_PATH, "w") as f:
+        json.dump(portfolio, f, indent=2)
+
+
+def _current_price(ticker: str):
+    """Prefers the most recent intraday tick (today's 1-minute bars) so 4x/day check-ins
+    reflect the price at that moment, not yesterday's close; falls back to daily close
+    when intraday data isn't available (e.g., market closed, illiquid ticker)."""
+    try:
+        intraday = yf.Ticker(ticker).history(period="1d", interval="1m")
+        if intraday is not None and not intraday.empty:
+            return float(intraday["Close"].iloc[-1])
+    except Exception:
+        pass
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if hist is None or hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception:
+        logger.warning("Could not fetch current price for %s", ticker)
+        return None
+
+
+def _check_open_positions(portfolio: dict) -> None:
+    today = date.today()
+    still_open = []
+    for pos in portfolio["open_positions"]:
+        price = _current_price(pos["ticker"])
+        if price is None:
+            still_open.append(pos)  # try again next check-in
+            continue
+
+        target_exit = date.fromisoformat(pos["target_exit_date"])
+        take_profit_price = pos["entry_price"] * (1 + TAKE_PROFIT_PCT)
+        exit_reason = None
+        if price <= pos["stop_loss_price"]:
+            exit_reason = "stop_loss"
+        elif price >= take_profit_price:
+            exit_reason = "take_profit"
+        elif today >= target_exit:
+            exit_reason = "hold_days_reached"
+
+        if exit_reason is None:
+            still_open.append(pos)
+            continue
+
+        realized_pnl = (price - pos["entry_price"]) * pos["shares"]
+        portfolio["cash"] += price * pos["shares"]
+        portfolio["closed_trades"].append(
+            {
+                **pos,
+                "exit_date": today.isoformat(),
+                "exit_price": price,
+                "exit_reason": exit_reason,
+                "realized_pnl": realized_pnl,
+                "realized_pnl_pct": (price / pos["entry_price"] - 1),
+            }
+        )
+        pnl_pct = (price / pos["entry_price"] - 1) * 100
+        logger.info("SOLD %s: %s, P&L %+.2f (%+.1f%%)", pos["ticker"], exit_reason, realized_pnl, pnl_pct)
+        _send_telegram(
+            f"🧪 *Paper trade SOLD* {pos['ticker']} — {exit_reason}\n"
+            f"P&L: ${realized_pnl:+.2f} ({pnl_pct:+.1f}%)"
+        )
+
+    portfolio["open_positions"] = still_open
+
+
+def _look_for_new_signals(portfolio: dict) -> None:
+    alerts = sec_insiders.fetch_alerts() + congress_trades.fetch_alerts()
+    considered = set(portfolio["considered_keys"])
+
+    for alert in alerts:
+        if alert.dedupe_key in considered:
+            continue
+        considered.add(alert.dedupe_key)
+        portfolio["considered_keys"].append(alert.dedupe_key)
+
+        if not alert.ticker:
+            continue
+
+        r = rating.get_rating(alert)
+        if r is None or r.suppress or r.hold_days is None or r.stop_loss_pct is None:
+            continue
+
+        if portfolio["cash"] < portfolio["position_size"]:
+            logger.info("Skipping %s: insufficient cash ($%.2f left)", alert.ticker, portfolio["cash"])
+            continue
+
+        price = _current_price(alert.ticker)
+        if price is None or price <= 0:
+            continue
+
+        shares = portfolio["position_size"] / price
+        portfolio["cash"] -= portfolio["position_size"]
+        portfolio["open_positions"].append(
+            {
+                "dedupe_key": alert.dedupe_key,
+                "ticker": alert.ticker,
+                "entity": alert.entity,
+                "person_name": alert.person_name,
+                "role": alert.role,
+                "entry_date": date.today().isoformat(),
+                "entry_price": price,
+                "shares": shares,
+                "dollar_amount": portfolio["position_size"],
+                "stop_loss_price": price * (1 + r.stop_loss_pct),
+                "target_exit_date": (date.today() + timedelta(days=r.hold_days)).isoformat(),
+                "hold_days": r.hold_days,
+            }
+        )
+        logger.info("BOUGHT %s: $%.2f (%.3f shares @ $%.2f)", alert.ticker, portfolio["position_size"], shares, price)
+        _send_telegram(
+            f"🧪 *Paper trade BUY* {alert.ticker} — ${portfolio['position_size']:.2f} @ ${price:.2f}\n"
+            f"{alert.role} · {alert.entity}\n"
+            f"Stop loss: ${price * (1 + r.stop_loss_pct):.2f}  |  Take profit: +{TAKE_PROFIT_PCT*100:.1f}%  |  "
+            f"Target hold: ~{r.hold_days}d"
+        )
+
+
+def _print_summary(portfolio: dict, send_to_telegram: bool) -> None:
+    open_value = 0.0
+    for pos in portfolio["open_positions"]:
+        price = _current_price(pos["ticker"]) or pos["entry_price"]
+        open_value += price * pos["shares"]
+
+    total_value = portfolio["cash"] + open_value
+    realized_pnl = sum(t["realized_pnl"] for t in portfolio["closed_trades"])
+    started_at = date.fromisoformat(portfolio["started_at"])
+    days_elapsed = (date.today() - started_at).days
+    return_pct = (total_value / portfolio["starting_cash"] - 1) * 100
+
+    lines = [
+        f"Day {days_elapsed} of {TEST_LENGTH_DAYS} (started {portfolio['started_at']})",
+        f"Cash: ${portfolio['cash']:,.2f}  |  Open positions: {len(portfolio['open_positions'])}  |  Closed trades: {len(portfolio['closed_trades'])}",
+        f"Realized P&L: ${realized_pnl:+,.2f}",
+        f"Portfolio value: ${total_value:,.2f} (started ${portfolio['starting_cash']:,.2f}, {return_pct:+.2f}%)",
+    ]
+    if days_elapsed >= TEST_LENGTH_DAYS:
+        lines.append("\n*** 7-day test window complete ***")
+
+    for line in lines:
+        print(line)
+
+    if send_to_telegram:
+        _send_telegram("🧪 *Paper trade daily summary*\n" + "\n".join(lines))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Check-in for the paper-trading strategy test")
+    parser.add_argument(
+        "--label", default="close", choices=["open", "noon", "3pm", "close"],
+        help="Which of the day's 4 check-ins this is; the daily Telegram summary only sends at 'close' "
+             "(stop-loss/take-profit/hold-days checks and buy/sell alerts still run at every check-in)",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    config.validate(require_telegram=False)
+
+    portfolio = _load_portfolio()
+    _check_open_positions(portfolio)
+
+    days_elapsed = (date.today() - date.fromisoformat(portfolio["started_at"])).days
+    if days_elapsed < TEST_LENGTH_DAYS:
+        _look_for_new_signals(portfolio)
+    else:
+        logger.info("7-day test window elapsed; no new positions will be opened (existing ones still close out normally).")
+
+    _save_portfolio(portfolio)
+    _print_summary(portfolio, send_to_telegram=(args.label == "close"))
+
+
+if __name__ == "__main__":
+    main()

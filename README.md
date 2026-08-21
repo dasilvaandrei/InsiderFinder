@@ -155,6 +155,22 @@ Segments with fewer than 20 historical samples are marked "not enough history ye
 `run_backtest.py` periodically (and commit the updated `ratings.json`) to keep this
 current — it's a static snapshot, not live-updating.
 
+## Paper trading (forward test)
+
+`paper_trade.py` runs the live strategy forward with virtual money instead of real
+trades — starts with $2,000, buys a fixed $400 per qualifying (non-suppressed) signal
+up to 5 concurrent positions, and exits each position at whichever comes first: its
+suggested stop loss or its suggested hold-days horizon. It's a genuine forward test,
+not another backtest — GitHub Actions doesn't run continuously, so
+`.github/workflows/paper-trade.yml` triggers it once a day (same cadence as the live
+alert bot); each run checks current prices against open positions' exit conditions,
+then looks for new signals. State persists in `paper_trading/portfolio.json` (via
+GitHub's cache, gitignored — not committed). After 7 days it stops opening new
+positions (existing ones still close out normally) and flags the test as complete in
+its summary output.
+
+Run it locally any time to check status: `python paper_trade.py`.
+
 ## Notes
 
 - edgartools handles SEC's fair-access rate limits internally; no manual throttling needed.
