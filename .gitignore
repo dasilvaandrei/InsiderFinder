@@ -5,3 +5,6 @@ __pycache__/
 venv/
 logs/*.log
 state/seen_alerts.json
+backtest/signals.db
+backtest/cache/
+backtest/reports/*.csv

@@ -115,6 +115,46 @@ Keeps a process running in the foreground and fires a run every day at 15:00 loc
 time via the `schedule` library. Use a process manager (`pm2`, `systemd`, Task
 Scheduler, `screen`/`tmux`) to keep it alive across reboots/logouts.
 
+## Backtesting and historical ratings
+
+`run_backtest.py` simulates buying at each historical signal to see whether the
+strategy actually works, without look-ahead bias: every signal is anchored to the
+date it became *publicly* known (SEC filing date / Senate PTR filed date), never the
+trade date, and the simulated entry is always the next trading day's open after that.
+
+```bash
+python run_backtest.py --start 2024-08-20 --end 2026-08-19
+```
+
+This downloads SEC's official quarterly bulk Form 3/4/5 data sets and scrapes Senate
+PTR filings for the range, prices each signal against SPY at several holding periods
+(1 to 30 trading days) using `yfinance`, and prints a table of win rate / average
+excess return per (role, dollar size, holding period) segment. Results are cached in
+`backtest/signals.db` (gitignored — regenerate locally, don't commit it) so re-runs
+are fast; `--skip-collect`/`--skip-prices` reuse what's already cached.
+
+Each run also writes `ratings.json` — a small, git-committed summary of those same
+segment stats. The live bot (`notifier.py`, via `rating.py`) reads this file and, for
+every new alert:
+
+- **Picks the best-performing holding horizon** for that (role, dollar size) segment
+  (highest risk-adjusted score among horizons with ≥20 historical samples), and
+  suggests it as the hold time.
+- **Suggests a stop loss** — the 20th percentile of historical stock returns at that
+  horizon ("in the worse ~20% of past cases, the stock had fallen to about this level
+  by now").
+- **Checks how far the stock has already moved since disclosure** (live `yfinance`
+  price vs. entry) against the historically typical move at that many days out, and
+  flags it ("⚠️ ... may be priced in") if it's already run further than ~1.5x typical.
+- **Suppresses the alert entirely** if that segment's best-scoring horizon has a
+  historical win rate below 50% (i.e., historically worse than just holding SPY) —
+  you won't see a Telegram message for it at all, only a log line.
+
+Segments with fewer than 20 historical samples are marked "not enough history yet"
+(sent, not suppressed — there just isn't enough evidence either way). Re-run
+`run_backtest.py` periodically (and commit the updated `ratings.json`) to keep this
+current — it's a static snapshot, not live-updating.
+
 ## Notes
 
 - edgartools handles SEC's fair-access rate limits internally; no manual throttling needed.

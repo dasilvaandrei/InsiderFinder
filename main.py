@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 
 import config
 import notifier
+import rating
 import state
 from sources import congress_trades, sec_insiders
 
@@ -37,11 +38,20 @@ def run_once(lookback_days: int = None, dry_run: bool = False) -> int:
         if not seen.is_new(alert.dedupe_key):
             continue
 
+        r = rating.get_rating(alert)
+        if r is not None and r.suppress:
+            logger.info(
+                "Suppressing %s / %s: bucket historically underperforms SPY (win rate %.0f%%)",
+                alert.person_name, alert.entity, r.win_rate * 100,
+            )
+            seen.mark_seen(alert.dedupe_key)
+            continue
+
         if dry_run:
-            print(notifier.format_message(alert))
+            print(notifier.format_message(alert, r))
             print("-" * 40)
         else:
-            if not notifier.send_alert(alert):
+            if not notifier.send_alert(alert, r):
                 continue
 
         seen.mark_seen(alert.dedupe_key)

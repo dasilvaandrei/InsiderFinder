@@ -9,10 +9,12 @@ class InsiderAlert:
     role: str             # e.g. "CEO", "Director", "Senator", "Representative"
     entity: str            # company name/ticker, or traded ticker for Congress
     transaction_type: str  # e.g. "Open Market Purchase"
-    transaction_date: str  # ISO date string
+    transaction_date: str  # ISO date string, when the trade actually happened
     value_low: float        # dollar value (SEC) or low end of disclosed range (Congress)
     value_display: str      # human-readable amount for the alert text
     url: str                # link to the filing/disclosure
+    ticker: str = ""         # bare ticker symbol, for price lookups
+    public_date: str = ""    # ISO date string, when the trade became publicly known (filing/filed date)
 
     @property
     def dedupe_key(self) -> str:

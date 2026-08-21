@@ -31,6 +31,15 @@ def _parse_amount_low(amount_text: str) -> float:
     return float(min(numbers)) if numbers else 0.0
 
 
+def normalize_filed_date(filed_date: str) -> str:
+    """The search results report the filed date as MM/DD/YYYY; normalize to ISO."""
+    try:
+        month, day, year = filed_date.split("/")
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    except (ValueError, AttributeError):
+        return filed_date or ""
+
+
 def _open_session() -> requests.Session:
     """Accept the eFD disclaimer to establish a search-capable session, per the site's own flow."""
     session = requests.Session()
@@ -64,24 +73,39 @@ def _open_session() -> requests.Session:
 def _search_ptr_filings(session: requests.Session, lookback_days: int) -> list:
     end = date.today()
     start = end - timedelta(days=lookback_days)
-    payload = {
-        "draw": "1",
-        "start": "0",
-        "length": "100",
-        "report_types": f"[{_PTR_REPORT_TYPE}]",
-        "filer_types": "[]",
-        "submitted_start_date": start.strftime("%m/%d/%Y 00:00:00"),
-        "submitted_end_date": end.strftime("%m/%d/%Y 23:59:59"),
-        "candidate_state": "",
-        "senator_state": "",
-        "office_id": "",
-        "first_name": "",
-        "last_name": "",
-        "csrfmiddlewaretoken": session.csrf_token,
-    }
-    response = session.post(_DATA_URL, data=payload, timeout=30)
-    response.raise_for_status()
-    return response.json().get("data", [])
+    return search_ptr_filings_between(session, start, end)
+
+
+def search_ptr_filings_between(session: requests.Session, start: date, end: date) -> list:
+    """Searches all PTR filings in [start, end], paginating past the site's 100-row page size."""
+    results = []
+    page_start = 0
+    page_length = 100
+    while True:
+        payload = {
+            "draw": "1",
+            "start": str(page_start),
+            "length": str(page_length),
+            "report_types": f"[{_PTR_REPORT_TYPE}]",
+            "filer_types": "[]",
+            "submitted_start_date": start.strftime("%m/%d/%Y 00:00:00"),
+            "submitted_end_date": end.strftime("%m/%d/%Y 23:59:59"),
+            "candidate_state": "",
+            "senator_state": "",
+            "office_id": "",
+            "first_name": "",
+            "last_name": "",
+            "csrfmiddlewaretoken": session.csrf_token,
+        }
+        response = session.post(_DATA_URL, data=payload, timeout=30)
+        response.raise_for_status()
+        payload_json = response.json()
+        page = payload_json.get("data", [])
+        results.extend(page)
+        if len(page) < page_length or page_start + page_length >= payload_json.get("recordsTotal", 0):
+            break
+        page_start += page_length
+    return results
 
 
 def _parse_transactions(session: requests.Session, report_url: str) -> List[dict]:
@@ -108,7 +132,7 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
     alerts: List[InsiderAlert] = []
     for row in rows:
         try:
-            first_name, last_name, _office, report_html, _filed_date = row
+            first_name, last_name, _office, report_html, filed_date = row
         except (ValueError, TypeError):
             continue
 
@@ -124,6 +148,7 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
             continue
 
         person_name = f"{first_name} {last_name}".strip()
+        public_date = normalize_filed_date(filed_date)
 
         for txn in transactions:
             transaction_type = str(txn.get("Type", ""))
@@ -133,17 +158,22 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
             if not filters.passes_congress_filter(transaction_type, value_low):
                 continue
 
+            ticker = str(txn.get("Ticker") or "").strip().upper()
+            entity = ticker if ticker and ticker != "--" else str(txn.get("Asset Name", "") or "")
+
             alerts.append(
                 InsiderAlert(
                     source="Congress",
                     person_name=person_name or "Unknown senator",
                     role="Senator",
-                    entity=str(txn.get("Ticker") or txn.get("Asset Name", "") or ""),
+                    entity=entity,
                     transaction_type="Purchase",
                     transaction_date=str(txn.get("Transaction Date", "")),
                     value_low=value_low,
                     value_display=amount_text,
                     url=report_url,
+                    ticker=ticker if ticker != "--" else "",
+                    public_date=public_date,
                 )
             )
 

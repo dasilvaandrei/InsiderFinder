@@ -108,6 +108,8 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
             filter(None, (getattr(o, "name", "") for o in owners))
         )
         issuer_label = _issuer_label(form4)
+        ticker = str(getattr(getattr(form4, "issuer", None), "ticker", "") or "")
+        public_date = str(getattr(filing, "filing_date", "") or "")
         url = getattr(filing, "homepage_url", None) or getattr(filing, "filing_url", "") or ""
 
         for row in purchases.to_dict(orient="records"):
@@ -134,6 +136,8 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
                     value_low=value,
                     value_display=f"${value:,.0f}",
                     url=url,
+                    ticker=ticker,
+                    public_date=public_date,
                 )
             )
 
