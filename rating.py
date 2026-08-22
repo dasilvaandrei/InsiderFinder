@@ -159,6 +159,12 @@ def get_rating(alert: InsiderAlert) -> Optional[Rating]:
         if move_note.startswith("⚠️"):
             label = "🟡 Mixed historical signal (extended move)"
 
+    stop_loss_pct = best.get("stop_loss_pct")
+    if stop_loss_pct is not None:
+        # The 20th percentile of a strong bucket's returns can itself be positive — clamp so
+        # the stop loss is always below entry, never above it.
+        stop_loss_pct = min(stop_loss_pct, 0.0)
+
     return Rating(
         label,
         best["win_rate"],
@@ -166,7 +172,7 @@ def get_rating(alert: InsiderAlert) -> Optional[Rating]:
         best["count"],
         best["horizon_days"],
         suppress=False,
-        stop_loss_pct=best.get("stop_loss_pct"),
+        stop_loss_pct=stop_loss_pct,
         hold_days=best["horizon_days"],
         move_note=move_note,
     )
