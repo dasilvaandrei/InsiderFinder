@@ -24,6 +24,15 @@ TAKE_PROFIT_PCT = 0.065  # matches the live paper-trading take-profit rule
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
 # spread/slippage on smaller-cap names, since no real fill data is available. No brokerage
 # commission is modeled separately since most retail brokers are commission-free today.
+HIGH_VOL_THRESHOLD = 0.20  # 20% annualized trailing realized SPY volatility -- not fit to this
+# dataset's outcomes: it's the classic "VIX ~20" level widely cited as when markets turn
+# nervous. Checked (not calibrated) against known stress episodes in the cached SPY history:
+# flags 60-94% of trading days during 2011's debt-ceiling crisis, 2018 Q4, the 2020 COVID
+# crash, and 2022's bear market, ~38% during the milder 2015-16 correction, and correctly does
+# NOT flag the 2013 taper tantrum (a bond-market event, not an equity-volatility spike) --
+# while flagging under ~15% of days in calm years (2016, 2017, 2019, 2021, 2025). Year-by-year
+# backtesting found 2018, the 2020 crash weeks, and 2022 were the only periods where the
+# strategy's stock-picking component lost money, which is the reason for gating on this at all.
 
 
 class SpyPriceLookup:
@@ -43,6 +52,58 @@ class SpyPriceLookup:
     @property
     def last_date(self) -> date:
         return self.dates[-1]
+
+
+class VolatilityRegime:
+    """Trailing 20-trading-day annualized realized volatility of SPY, and whether SPY is
+    trading below its own trailing 200-day moving average (the standard trend-following
+    threshold) -- both computed only from prior days (no look-ahead).
+
+    A pure volatility gate (skip new entries whenever realized vol > threshold) was tested and
+    found to make things WORSE in the specific years it was meant to help (2018, 2020, 2022 all
+    got worse, not better) while destroying an excellent year (2019) that had nothing wrong with
+    it -- because elevated volatility on its own doesn't separate bad trades from good ones, it
+    amplifies both directions. 2019 and much of 2020 were high-volatility but net UPTRENDING
+    (2020 in particular was a violent V-shaped recovery), unlike 2018 Q4 and 2022 which were
+    both genuinely elevated-vol AND declining. Combining the two conditions is meant to target
+    that more specific "stressed and falling" character rather than volatility alone."""
+
+    WINDOW = 20
+    TREND_WINDOW = 200
+    _ANNUALIZATION = 252 ** 0.5
+
+    def __init__(self, conn):
+        rows = conn.execute("SELECT date, close FROM prices WHERE ticker = 'SPY' ORDER BY date").fetchall()
+        self.dates = [date.fromisoformat(d) for d, _ in rows]
+        closes = [c for _, c in rows]
+        self._closes = closes
+        self._vol = [None] * len(closes)
+        self._sma = [None] * len(closes)
+        for i in range(len(closes)):
+            if i >= self.WINDOW:
+                window = closes[i - self.WINDOW:i + 1]
+                rets = [window[j] / window[j - 1] - 1 for j in range(1, len(window))]
+                mean = sum(rets) / len(rets)
+                variance = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+                self._vol[i] = (variance ** 0.5) * self._ANNUALIZATION
+            if i >= self.TREND_WINDOW - 1:
+                self._sma[i] = sum(closes[i - self.TREND_WINDOW + 1:i + 1]) / self.TREND_WINDOW
+
+    def _index(self, d: date) -> int:
+        return max(bisect.bisect_right(self.dates, d) - 1, 0)
+
+    def realized_vol(self, d: date):
+        return self._vol[self._index(d)]
+
+    def is_downtrend(self, d: date) -> bool:
+        idx = self._index(d)
+        sma = self._sma[idx]
+        return sma is not None and self._closes[idx] < sma
+
+    def is_stressed(self, d: date, vol_threshold: float) -> bool:
+        """True only when BOTH elevated (above vol_threshold) AND in a downtrend."""
+        rv = self.realized_vol(d)
+        return rv is not None and rv > vol_threshold and self.is_downtrend(d)
 
 
 def _load_signals(conn) -> list:
@@ -101,7 +162,13 @@ def _is_plausible_step(prev_price: float, price: float) -> bool:
     return prev_price / _MAX_STEP_MOVE_RATIO <= price <= prev_price * _MAX_STEP_MOVE_RATIO
 
 
-def _simulate_trade(conn, alert: InsiderAlert, strategy: dict):
+BASELINE_VOL = 0.12  # ~typical calm-year trailing realized SPY vol (2016: 12.3%, 2019: 12.6%,
+# 2021: 12.4%) -- the reference point stop_loss_widen scales against.
+MAX_VOL_SCALE = 2.0  # cap on how much wider a stop-loss can get, however extreme current vol is
+
+
+def _simulate_trade(conn, alert: InsiderAlert, strategy: dict, vol_regime: "VolatilityRegime" = None,
+                     stop_loss_widen: bool = False):
     checkpoints = _price_checkpoints(conn, alert.ticker)
     if not checkpoints:
         return None
@@ -116,7 +183,17 @@ def _simulate_trade(conn, alert: InsiderAlert, strategy: dict):
     if entry_idx > 0 and not _is_plausible_step(checkpoints[entry_idx - 1][3], entry_price):
         return None  # entry itself lands right on a split/data discontinuity
 
-    stop_loss_price = entry_price * (1 + strategy["stop_loss_pct"])
+    stop_loss_pct = strategy["stop_loss_pct"]
+    if stop_loss_widen and vol_regime is not None:
+        rv = vol_regime.realized_vol(entry_date)
+        if rv is not None and rv > BASELINE_VOL:
+            # stop_loss_pct is negative (e.g. -0.03); scaling it up widens the stop below entry,
+            # giving the position more room during volatile stretches instead of getting chopped
+            # out by ordinary noise -- the mechanism the original 2018/2020/2022 diagnosis pointed
+            # at (stop-losses calibrated on calmer periods get hit more often, and worse, in vol).
+            stop_loss_pct *= min(rv / BASELINE_VOL, MAX_VOL_SCALE)
+
+    stop_loss_price = entry_price * (1 + stop_loss_pct)
     take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
     hold_days = strategy["hold_days"]
 
@@ -266,14 +343,18 @@ def print_portfolio_summary(result: dict, header_line: str) -> None:
     )
 
 
-def replay(starting_cash: float = STARTING_CASH, equitize_cash: bool = True) -> None:
+def replay(starting_cash: float = STARTING_CASH, equitize_cash: bool = True, vol_gate: bool = False,
+           vol_threshold: float = HIGH_VOL_THRESHOLD, require_downtrend: bool = True,
+           stop_loss_widen: bool = False) -> None:
     conn = connect()
     signal_rows = _load_signals(conn)
     spy = SpyPriceLookup(conn) if equitize_cash else None
+    vol_regime = VolatilityRegime(conn) if (vol_gate or stop_loss_widen) else None
 
     candidates = []
     skipped_no_rating = 0
     skipped_no_price = 0
+    skipped_high_vol = 0
     for sid, source, person_name, role, ticker, transaction_date, public_date, value, url in signal_rows:
         if not ticker or not public_date:
             continue
@@ -295,16 +376,28 @@ def replay(starting_cash: float = STARTING_CASH, equitize_cash: bool = True) -> 
             skipped_no_rating += 1
             continue
 
-        trade = _simulate_trade(conn, alert, strategy)
+        trade = _simulate_trade(conn, alert, strategy, vol_regime=vol_regime, stop_loss_widen=stop_loss_widen)
         if trade is None:
             skipped_no_price += 1
             continue
+
+        if vol_gate:
+            is_gated = (
+                vol_regime.is_stressed(trade["entry_date"], vol_threshold)
+                if require_downtrend
+                else (vol_regime.realized_vol(trade["entry_date"]) or 0) > vol_threshold
+            )
+            if is_gated:
+                skipped_high_vol += 1
+                continue
+
         candidates.append(trade)
 
     result = run_portfolio_simulation(candidates, starting_cash=starting_cash, spy=spy)
     header = (
         f"{len(signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
-        f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
+        f"{skipped_no_price} skipped (no price data) | {skipped_high_vol} skipped (regime gate) | "
+        f"{len(candidates)} qualifying trades | "
         f"{len(result['taken'])} actually taken ({result['skipped_no_cash']} skipped for lack of cash)"
     )
     print_portfolio_summary(result, header)
@@ -317,10 +410,22 @@ def main() -> None:
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
     parser.add_argument("--no-equitize-cash", action="store_true",
                          help="Let idle cash sit at 0%% instead of tracking it as SPY shares between trades")
+    parser.add_argument("--vol-gate", action="store_true",
+                         help="Skip new entries during the regime gate (see --vol-only-gate for its definition)")
+    parser.add_argument("--vol-threshold", type=float, default=HIGH_VOL_THRESHOLD,
+                         help="Annualized realized-vol cutoff for --vol-gate (default 0.20 = 20%%)")
+    parser.add_argument("--vol-only-gate", action="store_true",
+                         help="With --vol-gate, trigger on elevated volatility alone (no downtrend "
+                              "requirement) -- tested and found to hurt performance; kept for comparison")
+    parser.add_argument("--stop-loss-widen", action="store_true",
+                         help="Widen the stop-loss (not skip the trade) when trailing SPY realized "
+                              "volatility exceeds BASELINE_VOL, up to MAX_VOL_SCALE times wider")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    replay(starting_cash=args.starting_cash, equitize_cash=not args.no_equitize_cash)
+    replay(starting_cash=args.starting_cash, equitize_cash=not args.no_equitize_cash,
+           vol_gate=args.vol_gate, vol_threshold=args.vol_threshold, require_downtrend=not args.vol_only_gate,
+           stop_loss_widen=args.stop_loss_widen)
 
 
 if __name__ == "__main__":

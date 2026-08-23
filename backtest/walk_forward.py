@@ -4,8 +4,10 @@ from datetime import date, timedelta
 
 from backtest.db import connect
 from backtest.replay_full_history import (
+    HIGH_VOL_THRESHOLD,
     STARTING_CASH,
     SpyPriceLookup,
+    VolatilityRegime,
     _simulate_trade,
     print_portfolio_summary,
     run_portfolio_simulation,
@@ -55,9 +57,12 @@ def _load_test_signals(conn, split_date: str, test_end_date: str = None) -> list
 
 
 def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, equitize_cash: bool = True,
-                  test_end_date: str = None, verbose: bool = True) -> dict:
+                  test_end_date: str = None, verbose: bool = True, vol_gate: bool = False,
+                  vol_threshold: float = HIGH_VOL_THRESHOLD, require_downtrend: bool = True,
+                  stop_loss_widen: bool = False) -> dict:
     conn = connect()
     spy = SpyPriceLookup(conn) if equitize_cash else None
+    vol_regime = VolatilityRegime(conn) if (vol_gate or stop_loss_widen) else None
     if split_date is None:
         split_date = _default_split_date(conn)
 
@@ -73,6 +78,7 @@ def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, e
     candidates = []
     skipped_no_rating = 0
     skipped_no_price = 0
+    skipped_high_vol = 0
     for sid, source, person_name, role, ticker, transaction_date, public_date, value, url in test_signal_rows:
         if not ticker or not public_date:
             continue
@@ -94,10 +100,21 @@ def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, e
             skipped_no_rating += 1
             continue
 
-        trade = _simulate_trade(conn, alert, strategy)
+        trade = _simulate_trade(conn, alert, strategy, vol_regime=vol_regime, stop_loss_widen=stop_loss_widen)
         if trade is None:
             skipped_no_price += 1
             continue
+
+        if vol_gate:
+            is_gated = (
+                vol_regime.is_stressed(trade["entry_date"], vol_threshold)
+                if require_downtrend
+                else (vol_regime.realized_vol(trade["entry_date"]) or 0) > vol_threshold
+            )
+            if is_gated:
+                skipped_high_vol += 1
+                continue
+
         candidates.append(trade)
 
     result = run_portfolio_simulation(candidates, starting_cash=starting_cash, spy=spy)
@@ -108,7 +125,8 @@ def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, e
         header = (
             f"Test period: signals from {test_range} (never used to calibrate the strategy) | "
             f"{len(test_signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
-            f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
+            f"{skipped_no_price} skipped (no price data) | {skipped_high_vol} skipped (regime gate) | "
+            f"{len(candidates)} qualifying trades | "
             f"{len(result['taken'])} actually taken ({result['skipped_no_cash']} skipped for lack of cash)"
         )
         print_portfolio_summary(result, header)
@@ -128,10 +146,22 @@ def main() -> None:
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
     parser.add_argument("--no-equitize-cash", action="store_true",
                          help="Let idle cash sit at 0%% instead of tracking it as SPY shares between trades")
+    parser.add_argument("--vol-gate", action="store_true",
+                         help="Skip new entries during the regime gate (see --vol-only-gate for its definition)")
+    parser.add_argument("--vol-threshold", type=float, default=HIGH_VOL_THRESHOLD,
+                         help="Annualized realized-vol cutoff for --vol-gate (default 0.20 = 20%%)")
+    parser.add_argument("--vol-only-gate", action="store_true",
+                         help="With --vol-gate, trigger on elevated volatility alone (no downtrend "
+                              "requirement) -- tested and found to hurt performance; kept for comparison")
+    parser.add_argument("--stop-loss-widen", action="store_true",
+                         help="Widen the stop-loss (not skip the trade) when trailing SPY realized "
+                              "volatility exceeds BASELINE_VOL, up to MAX_VOL_SCALE times wider")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    walk_forward(args.split_date, starting_cash=args.starting_cash, equitize_cash=not args.no_equitize_cash)
+    walk_forward(args.split_date, starting_cash=args.starting_cash, equitize_cash=not args.no_equitize_cash,
+                 vol_gate=args.vol_gate, vol_threshold=args.vol_threshold, require_downtrend=not args.vol_only_gate,
+                 stop_loss_widen=args.stop_loss_widen)
 
 
 if __name__ == "__main__":

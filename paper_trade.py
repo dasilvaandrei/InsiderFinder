@@ -27,6 +27,12 @@ TEST_LENGTH_DAYS = 7
 TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
 # spread/slippage on smaller-cap names, since no real fill data is available.
+BASELINE_VOL = 0.12  # ~typical calm-year trailing realized SPY vol -- widening reference point.
+MAX_VOL_SCALE = 2.0  # cap on how much wider a stop-loss can get, however extreme current vol is.
+# Backtesting found stop-losses calibrated on calmer periods get hit too readily during volatile
+# stretches (2018, the 2020 crash, 2022); widening them proportionally to current volatility
+# (rather than skipping trades outright, which was tried and found to hurt performance instead)
+# improved stock-picking P&L in 12 of 13 years tested, including all three bad ones.
 
 _TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -112,6 +118,25 @@ def _current_price(ticker: str):
         return None
 
 
+def _realized_vol():
+    """Trailing 20-trading-day annualized realized volatility of SPY, computed live each
+    check-in -- same methodology validated in backtest/replay_full_history.py's
+    VolatilityRegime. Used to widen new positions' stop-losses during volatile stretches
+    instead of skipping trades outright."""
+    try:
+        hist = yf.Ticker("SPY").history(period="2mo")
+        if hist is None or len(hist) < 21:
+            return None
+        closes = hist["Close"].tolist()[-21:]
+        rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+        mean = sum(rets) / len(rets)
+        variance = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        return (variance ** 0.5) * (252 ** 0.5)
+    except Exception:
+        logger.warning("Could not compute realized volatility")
+        return None
+
+
 def _check_open_positions(portfolio: dict, spy_price: float) -> None:
     today = date.today()
     still_open = []
@@ -159,7 +184,7 @@ def _check_open_positions(portfolio: dict, spy_price: float) -> None:
     portfolio["open_positions"] = still_open
 
 
-def _look_for_new_signals(portfolio: dict, spy_price: float) -> None:
+def _look_for_new_signals(portfolio: dict, spy_price: float, realized_vol: float = None) -> None:
     alerts = sec_insiders.fetch_alerts() + congress_trades.fetch_alerts()
     considered = set(portfolio["considered_keys"])
 
@@ -185,6 +210,11 @@ def _look_for_new_signals(portfolio: dict, spy_price: float) -> None:
         if price is None or price <= 0:
             continue
 
+        stop_loss_pct = r.stop_loss_pct
+        if realized_vol is not None and realized_vol > BASELINE_VOL:
+            stop_loss_pct *= min(realized_vol / BASELINE_VOL, MAX_VOL_SCALE)
+        stop_loss_price = price * (1 + stop_loss_pct)
+
         position_size = min(cash_value * portfolio.get("position_size_pct", POSITION_SIZE_PCT), MAX_POSITION_SIZE)
         effective_entry_price = price * (1 + TRANSACTION_COST_PCT)
         shares = position_size / effective_entry_price
@@ -201,7 +231,7 @@ def _look_for_new_signals(portfolio: dict, spy_price: float) -> None:
                 "effective_entry_price": effective_entry_price,  # cost-adjusted, for real P&L
                 "shares": shares,
                 "dollar_amount": position_size,
-                "stop_loss_price": price * (1 + r.stop_loss_pct),
+                "stop_loss_price": stop_loss_price,
                 "target_exit_date": (date.today() + timedelta(days=r.hold_days)).isoformat(),
                 "hold_days": r.hold_days,
             }
@@ -210,7 +240,7 @@ def _look_for_new_signals(portfolio: dict, spy_price: float) -> None:
         _send_telegram(
             f"🧪 *Paper trade BUY* {alert.ticker} — ${position_size:.2f} @ ${price:.2f}\n"
             f"{alert.role} · {alert.entity}\n"
-            f"Stop loss: ${price * (1 + r.stop_loss_pct):.2f}  |  Take profit: +{TAKE_PROFIT_PCT*100:.1f}%  |  "
+            f"Stop loss: ${stop_loss_price:.2f}  |  Take profit: +{TAKE_PROFIT_PCT*100:.1f}%  |  "
             f"Target hold: ~{r.hold_days}d"
         )
 
@@ -268,7 +298,7 @@ def main() -> None:
 
     days_elapsed = (date.today() - date.fromisoformat(portfolio["started_at"])).days
     if days_elapsed < TEST_LENGTH_DAYS:
-        _look_for_new_signals(portfolio, spy_price)
+        _look_for_new_signals(portfolio, spy_price, realized_vol=_realized_vol())
     else:
         logger.info("7-day test window elapsed; no new positions will be opened (existing ones still close out normally).")
 

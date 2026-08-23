@@ -20,8 +20,30 @@ _MIN_CASH_TO_TRADE = 1.0  # skip once remaining cash is too small to matter
 TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
 # spread/slippage on smaller-cap names, since no real fill data is available.
+BASELINE_VOL = 0.12  # ~typical calm-year trailing realized SPY vol -- widening reference point.
+MAX_VOL_SCALE = 2.0  # cap on how much wider a stop-loss can get, however extreme current vol is.
+# See backtest/replay_full_history.py for how this was validated (broadly positive across 12 of
+# 13 years tested, including the known-bad ones -- unlike skipping trades outright, which was
+# tried first and found to hurt performance).
 
 _price_cache = {}
+
+
+def _realized_vol():
+    """Trailing 20-trading-day annualized realized volatility of SPY, same methodology as
+    backtest/replay_full_history.py's VolatilityRegime."""
+    try:
+        hist = yf.Ticker("SPY").history(period="2mo")
+        if hist is None or len(hist) < 21:
+            return None
+        closes = hist["Close"].tolist()[-21:]
+        rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+        mean = sum(rets) / len(rets)
+        variance = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        return (variance ** 0.5) * (252 ** 0.5)
+    except Exception:
+        logger.warning("Could not compute realized volatility")
+        return None
 
 
 def _price_series(ticker: str, start: date):
@@ -57,7 +79,7 @@ def _build_checkpoints(series) -> list:
     return checkpoints
 
 
-def _simulate_trade(alert, r) -> dict:
+def _simulate_trade(alert, r, realized_vol: float = None) -> dict:
     """Computes the hypothetical entry/exit for one alert, checking stop-loss/take-profit/
     hold-days at 4 intraday checkpoints/day instead of just end-of-day. Ignores capital
     constraints (those are applied afterward, chronologically, in replay())."""
@@ -74,7 +96,11 @@ def _simulate_trade(alert, r) -> dict:
     if entry_price <= 0:
         return None
 
-    stop_loss_price = entry_price * (1 + r.stop_loss_pct)
+    stop_loss_pct = r.stop_loss_pct
+    if realized_vol is not None and realized_vol > BASELINE_VOL:
+        stop_loss_pct *= min(realized_vol / BASELINE_VOL, MAX_VOL_SCALE)
+
+    stop_loss_price = entry_price * (1 + stop_loss_pct)
     take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
 
     for day_index, day, label, price in checkpoints:
@@ -99,6 +125,10 @@ def _simulate_trade(alert, r) -> dict:
 def replay(lookback_days: int, starting_cash: float = STARTING_CASH) -> None:
     config.validate(require_telegram=False)
 
+    # A single current snapshot, not a per-entry-date historical series like the backtest uses --
+    # a reasonable simplification given this replay only ever covers a short (~2-week) window.
+    realized_vol = _realized_vol()
+
     alerts = sec_insiders.fetch_alerts(lookback_days) + congress_trades.fetch_alerts(lookback_days)
     alerts = [a for a in alerts if a.ticker and a.public_date]
 
@@ -113,7 +143,7 @@ def replay(lookback_days: int, starting_cash: float = STARTING_CASH) -> None:
         if r is None or r.suppress or r.hold_days is None or r.stop_loss_pct is None:
             continue
 
-        trade = _simulate_trade(alert, r)
+        trade = _simulate_trade(alert, r, realized_vol=realized_vol)
         if trade is not None:
             candidates.append(trade)
 
