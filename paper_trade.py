@@ -49,7 +49,6 @@ def _load_portfolio() -> dict:
     if not os.path.exists(PORTFOLIO_PATH):
         return {
             "starting_cash": STARTING_CASH,
-            "cash": STARTING_CASH,
             "position_size_pct": POSITION_SIZE_PCT,
             "started_at": date.today().isoformat(),
             "considered_keys": [],
@@ -58,6 +57,33 @@ def _load_portfolio() -> dict:
         }
     with open(PORTFOLIO_PATH) as f:
         return json.load(f)
+
+
+def _spy_price(portfolio: dict):
+    """Live SPY price, used both to mark-to-market idle cash and to convert dollar amounts
+    into/out of the equitized cash_shares balance. Falls back to the last price this script
+    successfully saw if the live fetch fails, so a transient yfinance hiccup doesn't stall a
+    check-in; returns None only if there's neither a fresh price nor any prior one to fall
+    back on (only possible on this script's very first-ever run)."""
+    price = _current_price("SPY")
+    if price is not None and price > 0:
+        portfolio["last_spy_price"] = price
+        return price
+    return portfolio.get("last_spy_price")
+
+
+def _ensure_cash_shares(portfolio: dict, spy_price: float) -> None:
+    """Initializes cash_shares on a brand-new portfolio, or migrates an older portfolio.json
+    that still has a plain dollar "cash" field (from before cash was equitized into SPY) by
+    converting its current dollar balance into the equivalent number of SPY shares at today's
+    price -- a one-time conversion, not a retroactive rewrite of the cash the test already
+    held while un-equitized."""
+    if "cash_shares" in portfolio:
+        return
+    if "cash" in portfolio:
+        portfolio["cash_shares"] = portfolio.pop("cash") / spy_price
+    else:
+        portfolio["cash_shares"] = portfolio["starting_cash"] / spy_price
 
 
 def _save_portfolio(portfolio: dict) -> None:
@@ -86,7 +112,7 @@ def _current_price(ticker: str):
         return None
 
 
-def _check_open_positions(portfolio: dict) -> None:
+def _check_open_positions(portfolio: dict, spy_price: float) -> None:
     today = date.today()
     still_open = []
     for pos in portfolio["open_positions"]:
@@ -112,7 +138,7 @@ def _check_open_positions(portfolio: dict) -> None:
         effective_exit_price = price * (1 - TRANSACTION_COST_PCT)
         effective_entry_price = pos.get("effective_entry_price", pos["entry_price"])
         realized_pnl = (effective_exit_price - effective_entry_price) * pos["shares"]
-        portfolio["cash"] += effective_exit_price * pos["shares"]
+        portfolio["cash_shares"] += (effective_exit_price * pos["shares"]) / spy_price
         portfolio["closed_trades"].append(
             {
                 **pos,
@@ -133,7 +159,7 @@ def _check_open_positions(portfolio: dict) -> None:
     portfolio["open_positions"] = still_open
 
 
-def _look_for_new_signals(portfolio: dict) -> None:
+def _look_for_new_signals(portfolio: dict, spy_price: float) -> None:
     alerts = sec_insiders.fetch_alerts() + congress_trades.fetch_alerts()
     considered = set(portfolio["considered_keys"])
 
@@ -150,18 +176,19 @@ def _look_for_new_signals(portfolio: dict) -> None:
         if r is None or r.suppress or r.hold_days is None or r.stop_loss_pct is None:
             continue
 
-        if portfolio["cash"] < _MIN_CASH_TO_TRADE:
-            logger.info("Skipping %s: insufficient cash ($%.2f left)", alert.ticker, portfolio["cash"])
+        cash_value = portfolio["cash_shares"] * spy_price
+        if cash_value < _MIN_CASH_TO_TRADE:
+            logger.info("Skipping %s: insufficient cash ($%.2f left)", alert.ticker, cash_value)
             continue
 
         price = _current_price(alert.ticker)
         if price is None or price <= 0:
             continue
 
-        position_size = min(portfolio["cash"] * portfolio.get("position_size_pct", POSITION_SIZE_PCT), MAX_POSITION_SIZE)
+        position_size = min(cash_value * portfolio.get("position_size_pct", POSITION_SIZE_PCT), MAX_POSITION_SIZE)
         effective_entry_price = price * (1 + TRANSACTION_COST_PCT)
         shares = position_size / effective_entry_price
-        portfolio["cash"] -= position_size
+        portfolio["cash_shares"] -= position_size / spy_price
         portfolio["open_positions"].append(
             {
                 "dedupe_key": alert.dedupe_key,
@@ -188,13 +215,14 @@ def _look_for_new_signals(portfolio: dict) -> None:
         )
 
 
-def _print_summary(portfolio: dict, send_to_telegram: bool) -> None:
+def _print_summary(portfolio: dict, spy_price: float, send_to_telegram: bool) -> None:
     open_value = 0.0
     for pos in portfolio["open_positions"]:
         price = _current_price(pos["ticker"]) or pos["entry_price"]
         open_value += price * pos["shares"]
 
-    total_value = portfolio["cash"] + open_value
+    cash_value = portfolio["cash_shares"] * spy_price
+    total_value = cash_value + open_value
     realized_pnl = sum(t["realized_pnl"] for t in portfolio["closed_trades"])
     started_at = date.fromisoformat(portfolio["started_at"])
     days_elapsed = (date.today() - started_at).days
@@ -202,7 +230,7 @@ def _print_summary(portfolio: dict, send_to_telegram: bool) -> None:
 
     lines = [
         f"Day {days_elapsed} of {TEST_LENGTH_DAYS} (started {portfolio['started_at']})",
-        f"Cash: ${portfolio['cash']:,.2f}  |  Open positions: {len(portfolio['open_positions'])}  |  Closed trades: {len(portfolio['closed_trades'])}",
+        f"Cash (equitized in SPY @ ${spy_price:.2f}): ${cash_value:,.2f}  |  Open positions: {len(portfolio['open_positions'])}  |  Closed trades: {len(portfolio['closed_trades'])}",
         f"Realized P&L: ${realized_pnl:+,.2f}",
         f"Portfolio value: ${total_value:,.2f} (started ${portfolio['starting_cash']:,.2f}, {return_pct:+.2f}%)",
     ]
@@ -229,16 +257,23 @@ def main() -> None:
     config.validate(require_telegram=False)
 
     portfolio = _load_portfolio()
-    _check_open_positions(portfolio)
+
+    spy_price = _spy_price(portfolio)
+    if spy_price is None:
+        logger.error("Could not determine a SPY price (live fetch failed, no prior price cached); skipping this check-in")
+        return
+    _ensure_cash_shares(portfolio, spy_price)
+
+    _check_open_positions(portfolio, spy_price)
 
     days_elapsed = (date.today() - date.fromisoformat(portfolio["started_at"])).days
     if days_elapsed < TEST_LENGTH_DAYS:
-        _look_for_new_signals(portfolio)
+        _look_for_new_signals(portfolio, spy_price)
     else:
         logger.info("7-day test window elapsed; no new positions will be opened (existing ones still close out normally).")
 
     _save_portfolio(portfolio)
-    _print_summary(portfolio, send_to_telegram=(args.label == "close"))
+    _print_summary(portfolio, spy_price, send_to_telegram=(args.label == "close"))
 
 
 if __name__ == "__main__":
