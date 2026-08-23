@@ -21,6 +21,7 @@ def collect(start_date: date, end_date: date) -> int:
     filters to qualifying Purchase transactions, and inserts them into the signals DB."""
     conn = db.connect()
     inserted = 0
+    raw_records = []
 
     try:
         session = _open_session()
@@ -57,25 +58,40 @@ def collect(start_date: date, end_date: date) -> int:
             amount_text = str(txn.get("Amount", ""))
             value_low = _parse_amount_low(amount_text)
 
-            if not filters.passes_congress_filter(transaction_type, value_low):
+            if not filters.is_qualifying_purchase_type(transaction_type):
                 continue
 
             ticker = str(txn.get("Ticker") or "").strip().upper()
             if not ticker or ticker == "--":
                 continue  # non-stock assets (funds, real estate, etc.) report ticker as "--"
 
-            db.insert_signal(
-                conn,
-                source="Congress",
-                person_name=person_name or "Unknown senator",
-                role="Senator",
-                ticker=ticker,
-                transaction_date=str(txn.get("Transaction Date", "")),
-                public_date=public_date,
-                value=value_low,
-                url=report_url,
+            raw_records.append(
+                {
+                    "ticker": ticker,
+                    "person_name": person_name or "Unknown senator",
+                    "value": value_low,
+                    "transaction_date": str(txn.get("Transaction Date", "")),
+                    "public_date": public_date,
+                    "url": report_url,
+                }
             )
-            inserted += 1
+
+    for event in filters.aggregate_purchase_events(raw_records):
+        if not filters.passes_value_threshold(event["value"]):
+            continue
+
+        db.insert_signal(
+            conn,
+            source="Congress",
+            person_name=event["person_name"],
+            role="Senator",
+            ticker=event["ticker"],
+            transaction_date=event["transaction_date"],
+            public_date=event["public_date"],
+            value=event["value"],
+            url=event["url"],
+        )
+        inserted += 1
 
     conn.commit()
     conn.close()

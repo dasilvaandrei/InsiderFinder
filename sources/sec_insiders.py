@@ -88,7 +88,7 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
         logger.exception("Failed to list SEC Form 4 filings")
         return []
 
-    alerts: List[InsiderAlert] = []
+    raw_records = []
     for filing in filings:
         try:
             form4 = filing.obj()
@@ -122,23 +122,45 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
             except (TypeError, ValueError):
                 value = 0.0
 
-            if not filters.passes_sec_filter(code, acquired_disposed, value, role):
+            if not filters.is_qualifying_purchase_line(code, acquired_disposed, role):
                 continue
 
-            alerts.append(
-                InsiderAlert(
-                    source="SEC",
-                    person_name=person_name or "Unknown insider",
-                    role=role or "Insider",
-                    entity=issuer_label,
-                    transaction_type="Open Market Purchase",
-                    transaction_date=str(row.get("Date", "")),
-                    value_low=value,
-                    value_display=f"${value:,.0f}",
-                    url=url,
-                    ticker=ticker,
-                    public_date=public_date,
-                )
+            raw_records.append(
+                {
+                    "ticker": ticker,
+                    "person_name": person_name or "Unknown insider",
+                    "role": role or "Insider",
+                    "entity": issuer_label,
+                    "value": value,
+                    "transaction_date": str(row.get("Date", "")),
+                    "public_date": public_date,
+                    "url": url,
+                }
             )
+
+    alerts: List[InsiderAlert] = []
+    for event in filters.aggregate_purchase_events(raw_records):
+        if not filters.passes_value_threshold(event["value"]):
+            continue
+
+        value_display = f"${event['value']:,.0f}"
+        if event["n_insiders"] > 1:
+            value_display += f" (largest of {event['n_insiders']} insiders buying today)"
+
+        alerts.append(
+            InsiderAlert(
+                source="SEC",
+                person_name=event["person_name"],
+                role=event["role"],
+                entity=event["entity"],
+                transaction_type="Open Market Purchase",
+                transaction_date=event["transaction_date"],
+                value_low=event["value"],
+                value_display=value_display,
+                url=event["url"],
+                ticker=event["ticker"],
+                public_date=event["public_date"],
+            )
+        )
 
     return alerts

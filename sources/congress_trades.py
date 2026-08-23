@@ -129,7 +129,8 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
         logger.exception("Failed to search Senate eFD Periodic Transaction Reports")
         return []
 
-    alerts: List[InsiderAlert] = []
+    raw_records = []
+    non_ticker_alerts: List[InsiderAlert] = []
     for row in rows:
         try:
             first_name, last_name, _office, report_html, filed_date = row
@@ -155,26 +156,66 @@ def fetch_alerts(lookback_days: Optional[int] = None) -> List[InsiderAlert]:
             amount_text = str(txn.get("Amount", ""))
             value_low = _parse_amount_low(amount_text)
 
-            if not filters.passes_congress_filter(transaction_type, value_low):
+            if not filters.is_qualifying_purchase_type(transaction_type):
                 continue
 
             ticker = str(txn.get("Ticker") or "").strip().upper()
-            entity = ticker if ticker and ticker != "--" else str(txn.get("Asset Name", "") or "")
-
-            alerts.append(
-                InsiderAlert(
-                    source="Congress",
-                    person_name=person_name or "Unknown senator",
-                    role="Senator",
-                    entity=entity,
-                    transaction_type="Purchase",
-                    transaction_date=str(txn.get("Transaction Date", "")),
-                    value_low=value_low,
-                    value_display=amount_text,
-                    url=report_url,
-                    ticker=ticker if ticker != "--" else "",
-                    public_date=public_date,
+            if not ticker or ticker == "--":
+                # Non-stock assets (funds, real estate, etc.) can't be aggregated by ticker or
+                # priced/rated later -- keep the original one-alert-per-line behavior for these.
+                if not filters.passes_value_threshold(value_low):
+                    continue
+                non_ticker_alerts.append(
+                    InsiderAlert(
+                        source="Congress",
+                        person_name=person_name or "Unknown senator",
+                        role="Senator",
+                        entity=str(txn.get("Asset Name", "") or ""),
+                        transaction_type="Purchase",
+                        transaction_date=str(txn.get("Transaction Date", "")),
+                        value_low=value_low,
+                        value_display=amount_text,
+                        url=report_url,
+                        ticker="",
+                        public_date=public_date,
+                    )
                 )
+                continue
+
+            raw_records.append(
+                {
+                    "ticker": ticker,
+                    "person_name": person_name or "Unknown senator",
+                    "value": value_low,
+                    "transaction_date": str(txn.get("Transaction Date", "")),
+                    "public_date": public_date,
+                    "url": report_url,
+                }
             )
+
+    alerts: List[InsiderAlert] = list(non_ticker_alerts)
+    for event in filters.aggregate_purchase_events(raw_records):
+        if not filters.passes_value_threshold(event["value"]):
+            continue
+
+        value_display = f"${event['value']:,.0f}+"
+        if event["n_insiders"] > 1:
+            value_display += f" (largest of {event['n_insiders']} lawmakers buying today)"
+
+        alerts.append(
+            InsiderAlert(
+                source="Congress",
+                person_name=event["person_name"],
+                role="Senator",
+                entity=event["ticker"],
+                transaction_type="Purchase",
+                transaction_date=event["transaction_date"],
+                value_low=event["value"],
+                value_display=value_display,
+                url=event["url"],
+                ticker=event["ticker"],
+                public_date=event["public_date"],
+            )
+        )
 
     return alerts

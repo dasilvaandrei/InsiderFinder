@@ -100,6 +100,7 @@ def collect(start_date: date, end_date: date) -> int:
         merged = purchases.merge(submissions, on="ACCESSION_NUMBER", how="inner")
         merged = merged.merge(owners_by_accession, on="ACCESSION_NUMBER", how="left")
 
+        raw_records = []
         for row in merged.itertuples(index=False):
             role = getattr(row, "RPTOWNER_TITLE", "") or ""
             acquired_disposed = str(getattr(row, "TRANS_ACQUIRED_DISP_CD", "A") or "A")
@@ -110,7 +111,7 @@ def collect(start_date: date, end_date: date) -> int:
             except (TypeError, ValueError):
                 value = 0.0
 
-            if not filters.passes_sec_filter("P", acquired_disposed, value, role):
+            if not filters.is_qualifying_purchase_line("P", acquired_disposed, role):
                 continue
 
             ticker = str(getattr(row, "ISSUERTRADINGSYMBOL", "") or "").strip()
@@ -123,16 +124,32 @@ def collect(start_date: date, end_date: date) -> int:
             cik = str(getattr(row, "ISSUERCIK", "")).lstrip("0") or "0"
             url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=4"
 
+            raw_records.append(
+                {
+                    "ticker": ticker,
+                    "person_name": getattr(row, "RPTOWNERNAME", "") or "",
+                    "role": role,
+                    "value": value,
+                    "transaction_date": trans_date,
+                    "public_date": filing_date,
+                    "url": url,
+                }
+            )
+
+        for event in filters.aggregate_purchase_events(raw_records):
+            if not filters.passes_value_threshold(event["value"]):
+                continue
+
             db.insert_signal(
                 conn,
                 source="SEC",
-                person_name=getattr(row, "RPTOWNERNAME", "") or "",
-                role=role,
-                ticker=ticker,
-                transaction_date=trans_date,
-                public_date=filing_date,
-                value=value,
-                url=url,
+                person_name=event["person_name"],
+                role=event["role"],
+                ticker=event["ticker"],
+                transaction_date=event["transaction_date"],
+                public_date=event["public_date"],
+                value=event["value"],
+                url=event["url"],
             )
             inserted += 1
 
