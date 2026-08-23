@@ -8,7 +8,17 @@ from rating import _bucket_rows, _best_horizon_row
 logger = logging.getLogger(__name__)
 
 STARTING_CASH = 2000.0
-POSITION_SIZE = 400.0
+POSITION_SIZE_PCT = 0.20  # 20% of current cash per trade, not a fixed dollar amount -- so a
+# losing streak shrinks future bet sizes instead of hitting a fixed floor. Found via walk-
+# forward testing: a fixed $400/$2,000 setup could be wiped out below its own minimum bet size
+# by a bad crash (COVID, Feb-Mar 2020) and never trade again for the rest of the test window.
+MAX_POSITION_SIZE = 3000.0  # hard dollar ceiling regardless of how much cash has accumulated --
+# found by testing at $100,000 starting capital: uncapped 20%-of-cash sizing grew into $70,000+
+# single positions in micro-cap insider-trade stocks by the later years (median position size
+# $17,049 across the run), which real markets in thinly-traded names couldn't absorb without
+# slippage far beyond the flat 0.15% assumption modeled here. $3,000 is a placeholder, not
+# backed by real liquidity data for these specific tickers -- adjust if a better estimate exists.
+_MIN_CASH_TO_TRADE = 1.0  # skip once remaining cash is too small to matter
 TAKE_PROFIT_PCT = 0.065  # matches the live paper-trading take-profit rule
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
 # spread/slippage on smaller-cap names, since no real fill data is available. No brokerage
@@ -114,15 +124,16 @@ def _simulate_trade(conn, alert: InsiderAlert, strategy: dict):
             "exit_date": last_day, "exit_price": last_price, "exit_reason": "still_open"}
 
 
-def run_portfolio_simulation(candidates: list) -> dict:
+def run_portfolio_simulation(candidates: list, starting_cash: float = STARTING_CASH) -> dict:
     """Chronological, capital-constrained trade selection: sorts candidates by entry date,
-    only takes a trade if $400 of cash is actually free at that point (releasing cash from
-    positions that have already exited by then), and skips it otherwise. Shared by the full-
-    history replay and the walk-forward out-of-sample test so both use identical portfolio
-    mechanics."""
+    sizes each trade at POSITION_SIZE_PCT of whatever cash is actually free at that point
+    (releasing cash from positions that have already exited by then). Proportional sizing means
+    a losing streak shrinks future bet sizes rather than hitting a fixed-dollar floor. Shared by
+    the full-history replay and the walk-forward out-of-sample test so both use identical
+    portfolio mechanics."""
     candidates = sorted(candidates, key=lambda t: t["entry_date"])
 
-    cash = STARTING_CASH
+    cash = starting_cash
     pending_exits = []  # (exit_date, dollars_freed)
     taken = []
     skipped_no_cash = 0
@@ -136,20 +147,27 @@ def run_portfolio_simulation(candidates: list) -> dict:
                 still_pending.append((exit_date, amount))
         pending_exits = still_pending
 
-        if cash < POSITION_SIZE:
+        if cash < _MIN_CASH_TO_TRADE:
             skipped_no_cash += 1
             continue
 
-        cash -= POSITION_SIZE
+        position_size = min(cash * POSITION_SIZE_PCT, MAX_POSITION_SIZE)
+        cash -= position_size
         # Entry/exit thresholds (stop-loss, take-profit, hold-days) are decided off the raw
         # market price in _simulate_trade(); the cost only affects the price actually paid/
-        # received, i.e. how many shares $400 buys and how much the sale actually nets.
+        # received, i.e. how many shares this position size buys and how much the sale nets.
         effective_entry_price = t["entry_price"] * (1 + TRANSACTION_COST_PCT)
         effective_exit_price = t["exit_price"] * (1 - TRANSACTION_COST_PCT)
-        shares = POSITION_SIZE / effective_entry_price
+        shares = position_size / effective_entry_price
         exit_value = effective_exit_price * shares
         pending_exits.append((t["exit_date"], exit_value))
-        taken.append({**t, "shares": shares, "pnl": exit_value - POSITION_SIZE, "pnl_pct": exit_value / POSITION_SIZE - 1})
+        taken.append({
+            **t,
+            "shares": shares,
+            "position_size": position_size,
+            "pnl": exit_value - position_size,
+            "pnl_pct": exit_value / position_size - 1,
+        })
 
     for exit_date, amount in pending_exits:
         cash += amount
@@ -157,7 +175,7 @@ def run_portfolio_simulation(candidates: list) -> dict:
     closed = [t for t in taken if t["exit_reason"] != "still_open"]
     open_ = [t for t in taken if t["exit_reason"] == "still_open"]
     total_pnl = sum(t["pnl"] for t in taken)
-    final_value = STARTING_CASH + total_pnl
+    final_value = starting_cash + total_pnl
 
     reasons = {}
     for t in taken:
@@ -169,6 +187,7 @@ def run_portfolio_simulation(candidates: list) -> dict:
         "open": open_,
         "total_pnl": total_pnl,
         "final_value": final_value,
+        "starting_cash": starting_cash,
         "skipped_no_cash": skipped_no_cash,
         "reasons": reasons,
     }
@@ -189,12 +208,12 @@ def print_portfolio_summary(result: dict, header_line: str) -> None:
     print(f"Closed trades: {len(result['closed'])}  |  Still open (mark-to-market): {len(result['open'])}")
     print(f"Total P&L: ${result['total_pnl']:+,.2f}")
     print(
-        f"Final value: ${result['final_value']:,.2f} (started ${STARTING_CASH:,.2f}, "
-        f"{(result['final_value']/STARTING_CASH-1)*100:+.2f}%)"
+        f"Final value: ${result['final_value']:,.2f} (started ${result['starting_cash']:,.2f}, "
+        f"{(result['final_value']/result['starting_cash']-1)*100:+.2f}%)"
     )
 
 
-def replay() -> None:
+def replay(starting_cash: float = STARTING_CASH) -> None:
     conn = connect()
     signal_rows = _load_signals(conn)
 
@@ -228,7 +247,7 @@ def replay() -> None:
             continue
         candidates.append(trade)
 
-    result = run_portfolio_simulation(candidates)
+    result = run_portfolio_simulation(candidates, starting_cash=starting_cash)
     header = (
         f"{len(signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
         f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
@@ -238,8 +257,14 @@ def replay() -> None:
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Replay the full cached signal history through the live strategy")
+    parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    replay()
+    replay(starting_cash=args.starting_cash)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,12 @@ from sources import congress_trades, sec_insiders
 logger = logging.getLogger(__name__)
 
 STARTING_CASH = 2000.0
-POSITION_SIZE = 400.0
+POSITION_SIZE_PCT = 0.20  # 20% of current cash per trade, not a fixed dollar amount -- so a
+# losing streak shrinks future bet sizes instead of hitting a fixed floor.
+MAX_POSITION_SIZE = 3000.0  # hard dollar ceiling regardless of accumulated cash -- see
+# backtest/replay_full_history.py for why (uncapped sizing produced $70,000+ single positions
+# in micro-cap stocks when tested at $100,000 starting capital).
+_MIN_CASH_TO_TRADE = 1.0  # skip once remaining cash is too small to matter
 TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
 # spread/slippage on smaller-cap names, since no real fill data is available.
@@ -91,7 +96,7 @@ def _simulate_trade(alert, r) -> dict:
             "exit_date": last_day, "exit_price": last_price, "exit_reason": "still_open"}
 
 
-def replay(lookback_days: int) -> None:
+def replay(lookback_days: int, starting_cash: float = STARTING_CASH) -> None:
     config.validate(require_telegram=False)
 
     alerts = sec_insiders.fetch_alerts(lookback_days) + congress_trades.fetch_alerts(lookback_days)
@@ -114,7 +119,7 @@ def replay(lookback_days: int) -> None:
 
     candidates.sort(key=lambda t: t["entry_date"])
 
-    cash = STARTING_CASH
+    cash = starting_cash
     pending_exits = []  # (exit_date, dollars_freed)
     taken = []
     skipped_no_cash = 0
@@ -128,17 +133,18 @@ def replay(lookback_days: int) -> None:
                 still_pending.append((exit_date, amount))
         pending_exits = still_pending
 
-        if cash < POSITION_SIZE:
+        if cash < _MIN_CASH_TO_TRADE:
             skipped_no_cash += 1
             continue
 
-        cash -= POSITION_SIZE
+        position_size = min(cash * POSITION_SIZE_PCT, MAX_POSITION_SIZE)
+        cash -= position_size
         effective_entry_price = t["entry_price"] * (1 + TRANSACTION_COST_PCT)
         effective_exit_price = t["exit_price"] * (1 - TRANSACTION_COST_PCT)
-        shares = POSITION_SIZE / effective_entry_price
+        shares = position_size / effective_entry_price
         exit_value = effective_exit_price * shares
         pending_exits.append((t["exit_date"], exit_value))
-        taken.append({**t, "shares": shares, "pnl": exit_value - POSITION_SIZE, "pnl_pct": exit_value / POSITION_SIZE - 1})
+        taken.append({**t, "shares": shares, "pnl": exit_value - position_size, "pnl_pct": exit_value / position_size - 1})
 
     for exit_date, amount in pending_exits:
         cash += amount
@@ -146,7 +152,7 @@ def replay(lookback_days: int) -> None:
     closed = [t for t in taken if t["exit_reason"] != "still_open"]
     open_ = [t for t in taken if t["exit_reason"] == "still_open"]
     total_pnl = sum(t["pnl"] for t in taken)
-    final_value = STARTING_CASH + total_pnl
+    final_value = starting_cash + total_pnl
 
     print(f"Replayed {lookback_days} days: {len(candidates)} qualifying signals, {len(taken)} taken "
           f"({skipped_no_cash} skipped for lack of cash)")
@@ -160,16 +166,17 @@ def replay(lookback_days: int) -> None:
     print()
     print(f"Closed trades: {len(closed)}  |  Still open (mark-to-market): {len(open_)}")
     print(f"Total P&L: ${total_pnl:+,.2f}")
-    print(f"Final value: ${final_value:,.2f} (started ${STARTING_CASH:,.2f}, {(final_value/STARTING_CASH-1)*100:+.2f}%)")
+    print(f"Final value: ${final_value:,.2f} (started ${starting_cash:,.2f}, {(final_value/starting_cash-1)*100:+.2f}%)")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay the paper-trading strategy over a recent historical window")
     parser.add_argument("--days", type=int, default=14, help="How many days back to replay (default 14)")
+    parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    replay(args.days)
+    replay(args.days, starting_cash=args.starting_cash)
 
 
 if __name__ == "__main__":

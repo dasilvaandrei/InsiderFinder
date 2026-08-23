@@ -15,7 +15,14 @@ logger = logging.getLogger(__name__)
 
 PORTFOLIO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trading", "portfolio.json")
 STARTING_CASH = 2000.0
-POSITION_SIZE = 400.0
+POSITION_SIZE_PCT = 0.20  # 20% of current cash per trade, not a fixed dollar amount -- so a
+# losing streak shrinks future bet sizes instead of hitting a fixed floor (found via walk-
+# forward backtesting: a fixed $400/$2,000 setup could be wiped out below its own minimum bet
+# size by a bad crash and never trade again for the rest of the test window).
+MAX_POSITION_SIZE = 3000.0  # hard dollar ceiling regardless of accumulated cash -- uncapped
+# 20%-of-cash sizing grew into $70,000+ single positions in micro-cap stocks when tested at
+# $100,000 starting capital, well beyond what thinly-traded names could realistically absorb.
+_MIN_CASH_TO_TRADE = 1.0  # skip once remaining cash is too small to matter
 TEST_LENGTH_DAYS = 7
 TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
@@ -43,7 +50,7 @@ def _load_portfolio() -> dict:
         return {
             "starting_cash": STARTING_CASH,
             "cash": STARTING_CASH,
-            "position_size": POSITION_SIZE,
+            "position_size_pct": POSITION_SIZE_PCT,
             "started_at": date.today().isoformat(),
             "considered_keys": [],
             "open_positions": [],
@@ -143,7 +150,7 @@ def _look_for_new_signals(portfolio: dict) -> None:
         if r is None or r.suppress or r.hold_days is None or r.stop_loss_pct is None:
             continue
 
-        if portfolio["cash"] < portfolio["position_size"]:
+        if portfolio["cash"] < _MIN_CASH_TO_TRADE:
             logger.info("Skipping %s: insufficient cash ($%.2f left)", alert.ticker, portfolio["cash"])
             continue
 
@@ -151,9 +158,10 @@ def _look_for_new_signals(portfolio: dict) -> None:
         if price is None or price <= 0:
             continue
 
+        position_size = min(portfolio["cash"] * portfolio.get("position_size_pct", POSITION_SIZE_PCT), MAX_POSITION_SIZE)
         effective_entry_price = price * (1 + TRANSACTION_COST_PCT)
-        shares = portfolio["position_size"] / effective_entry_price
-        portfolio["cash"] -= portfolio["position_size"]
+        shares = position_size / effective_entry_price
+        portfolio["cash"] -= position_size
         portfolio["open_positions"].append(
             {
                 "dedupe_key": alert.dedupe_key,
@@ -165,15 +173,15 @@ def _look_for_new_signals(portfolio: dict) -> None:
                 "entry_price": price,  # raw market price -- stop-loss/take-profit track this
                 "effective_entry_price": effective_entry_price,  # cost-adjusted, for real P&L
                 "shares": shares,
-                "dollar_amount": portfolio["position_size"],
+                "dollar_amount": position_size,
                 "stop_loss_price": price * (1 + r.stop_loss_pct),
                 "target_exit_date": (date.today() + timedelta(days=r.hold_days)).isoformat(),
                 "hold_days": r.hold_days,
             }
         )
-        logger.info("BOUGHT %s: $%.2f (%.3f shares @ $%.2f)", alert.ticker, portfolio["position_size"], shares, price)
+        logger.info("BOUGHT %s: $%.2f (%.3f shares @ $%.2f)", alert.ticker, position_size, shares, price)
         _send_telegram(
-            f"🧪 *Paper trade BUY* {alert.ticker} — ${portfolio['position_size']:.2f} @ ${price:.2f}\n"
+            f"🧪 *Paper trade BUY* {alert.ticker} — ${position_size:.2f} @ ${price:.2f}\n"
             f"{alert.role} · {alert.entity}\n"
             f"Stop loss: ${price * (1 + r.stop_loss_pct):.2f}  |  Take profit: +{TAKE_PROFIT_PCT*100:.1f}%  |  "
             f"Target hold: ~{r.hold_days}d"

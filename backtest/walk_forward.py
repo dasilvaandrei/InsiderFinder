@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 from backtest.db import connect
 from backtest.replay_full_history import (
+    STARTING_CASH,
     _simulate_trade,
     print_portfolio_summary,
     run_portfolio_simulation,
@@ -49,7 +50,7 @@ def _load_test_signals(conn, split_date: str) -> list:
     ).fetchall()
 
 
-def walk_forward(split_date: str = None) -> None:
+def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH) -> None:
     conn = connect()
     if split_date is None:
         split_date = _default_split_date(conn)
@@ -92,7 +93,7 @@ def walk_forward(split_date: str = None) -> None:
             continue
         candidates.append(trade)
 
-    result = run_portfolio_simulation(candidates)
+    result = run_portfolio_simulation(candidates, starting_cash=starting_cash)
     header = (
         f"Test period: signals from {split_date} onward (never used to calibrate the strategy) | "
         f"{len(test_signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
@@ -112,10 +113,11 @@ def main() -> None:
         help="ISO date; signals before this calibrate the strategy, signals on/after this are the held-out "
              "test set. Defaults to 70%% through the available SEC signal date range.",
     )
+    parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    walk_forward(args.split_date)
+    walk_forward(args.split_date, starting_cash=args.starting_cash)
 
 
 if __name__ == "__main__":
