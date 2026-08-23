@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 STARTING_CASH = 2000.0
 POSITION_SIZE = 400.0
 TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
+TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
+# spread/slippage on smaller-cap names, since no real fill data is available.
 
 _price_cache = {}
 
@@ -131,8 +133,10 @@ def replay(lookback_days: int) -> None:
             continue
 
         cash -= POSITION_SIZE
-        shares = POSITION_SIZE / t["entry_price"]
-        exit_value = t["exit_price"] * shares
+        effective_entry_price = t["entry_price"] * (1 + TRANSACTION_COST_PCT)
+        effective_exit_price = t["exit_price"] * (1 - TRANSACTION_COST_PCT)
+        shares = POSITION_SIZE / effective_entry_price
+        exit_value = effective_exit_price * shares
         pending_exits.append((t["exit_date"], exit_value))
         taken.append({**t, "shares": shares, "pnl": exit_value - POSITION_SIZE, "pnl_pct": exit_value / POSITION_SIZE - 1})
 

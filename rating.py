@@ -56,11 +56,17 @@ def _bucket_rows(source: str, role: str, value: float, buckets: Optional[list] =
 
 
 def _best_horizon_row(rows: list) -> Optional[dict]:
-    """The horizon with the best risk-adjusted score, among horizons with enough samples."""
+    """Selects by a t-statistic (risk_adjusted * sqrt(count)) rather than raw risk-adjusted
+    return, among horizons with enough samples. evaluate.py tests 10 different horizons per
+    bucket; picking whichever one has the single highest raw risk-adjusted ratio rewards
+    noise in small-sample buckets (a fluke in a 20-sample bucket looks identical to a real
+    edge). Scaling by sqrt(count) requires a horizon to be both good AND well-supported by
+    data before it's trusted -- the standard one-sample t-test statistic for "is this mean
+    excess return actually different from zero"."""
     qualified = [r for r in rows if r["count"] >= MIN_SAMPLE_SIZE]
     if not qualified:
         return None
-    return max(qualified, key=lambda r: r["risk_adjusted"])
+    return max(qualified, key=lambda r: r["risk_adjusted"] * (r["count"] ** 0.5))
 
 
 def _closest_horizon_row(rows: list, target_days: int) -> Optional[dict]:

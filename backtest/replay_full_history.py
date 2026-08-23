@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 STARTING_CASH = 2000.0
 POSITION_SIZE = 400.0
 TAKE_PROFIT_PCT = 0.065  # matches the live paper-trading take-profit rule
+TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
+# spread/slippage on smaller-cap names, since no real fill data is available. No brokerage
+# commission is modeled separately since most retail brokers are commission-free today.
 
 
 def _load_signals(conn) -> list:
@@ -36,6 +39,18 @@ def _get_strategy_rating(alert: InsiderAlert):
     return {"stop_loss_pct": stop_loss_pct, "hold_days": best["horizon_days"]}
 
 
+_MAX_STEP_MOVE_RATIO = 3.0  # a >3x (or <1/3x) move between consecutive checkpoints is almost
+# certainly an unadjusted stock split or a bad data point, not a genuine price move -- e.g.
+# VYNE's cached price jumped $0.76 -> $43.72 overnight (confirmed via a direct prices-table
+# query), producing a fictitious "take profit" hundreds of times bigger than the 6.5% rule
+# should ever allow. A trade whose price series contains one of these is excluded rather than
+# traded on, since neither the entry nor any exit along the way can be trusted.
+_MIN_ENTRY_PRICE = 1.0  # excludes penny stocks: e.g. NRIS traded at $0.06-$0.14 with open==close
+# flat for days at a stretch (confirmed via a direct prices-table query) -- essentially no real
+# trading activity, so the quoted price isn't something a $400 position could realistically be
+# filled at. Standard practice in backtesting to exclude sub-$1 names for this reason.
+
+
 def _price_checkpoints(conn, ticker: str) -> list:
     """Daily (open, close) checkpoints from the cached prices table. True intraday (1h) bars
     aren't available/cached for the full 2-year range (yfinance's hourly history only reaches
@@ -50,26 +65,39 @@ def _price_checkpoints(conn, ticker: str) -> list:
     return checkpoints
 
 
+def _is_plausible_step(prev_price: float, price: float) -> bool:
+    if price <= 0 or prev_price <= 0:
+        return False
+    return prev_price / _MAX_STEP_MOVE_RATIO <= price <= prev_price * _MAX_STEP_MOVE_RATIO
+
+
 def _simulate_trade(conn, alert: InsiderAlert, strategy: dict):
     checkpoints = _price_checkpoints(conn, alert.ticker)
     if not checkpoints:
         return None
 
     public = date.fromisoformat(alert.public_date)
-    entry_cp = next((cp for cp in checkpoints if cp[1] > public and cp[2] == "open"), None)
-    if entry_cp is None:
+    entry_idx = next((i for i, cp in enumerate(checkpoints) if cp[1] > public and cp[2] == "open"), None)
+    if entry_idx is None:
         return None
-    entry_day_index, entry_date, _, entry_price = entry_cp
-    if entry_price <= 0:
+    entry_day_index, entry_date, _, entry_price = checkpoints[entry_idx]
+    if entry_price < _MIN_ENTRY_PRICE:
         return None
+    if entry_idx > 0 and not _is_plausible_step(checkpoints[entry_idx - 1][3], entry_price):
+        return None  # entry itself lands right on a split/data discontinuity
 
     stop_loss_price = entry_price * (1 + strategy["stop_loss_pct"])
     take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
     hold_days = strategy["hold_days"]
 
-    for day_index, day, label, price in checkpoints:
+    prev_price = entry_price
+    for day_index, day, label, price in checkpoints[entry_idx:]:
         if day_index < entry_day_index or (day_index == entry_day_index and label == "open"):
             continue
+
+        if not _is_plausible_step(prev_price, price):
+            return None
+        prev_price = price
 
         if price <= stop_loss_price:
             return {"alert": alert, "entry_date": entry_date, "entry_price": entry_price,
@@ -113,8 +141,13 @@ def run_portfolio_simulation(candidates: list) -> dict:
             continue
 
         cash -= POSITION_SIZE
-        shares = POSITION_SIZE / t["entry_price"]
-        exit_value = t["exit_price"] * shares
+        # Entry/exit thresholds (stop-loss, take-profit, hold-days) are decided off the raw
+        # market price in _simulate_trade(); the cost only affects the price actually paid/
+        # received, i.e. how many shares $400 buys and how much the sale actually nets.
+        effective_entry_price = t["entry_price"] * (1 + TRANSACTION_COST_PCT)
+        effective_exit_price = t["exit_price"] * (1 - TRANSACTION_COST_PCT)
+        shares = POSITION_SIZE / effective_entry_price
+        exit_value = effective_exit_price * shares
         pending_exits.append((t["exit_date"], exit_value))
         taken.append({**t, "shares": shares, "pnl": exit_value - POSITION_SIZE, "pnl_pct": exit_value / POSITION_SIZE - 1})
 

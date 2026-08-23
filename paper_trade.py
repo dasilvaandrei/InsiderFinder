@@ -18,6 +18,8 @@ STARTING_CASH = 2000.0
 POSITION_SIZE = 400.0
 TEST_LENGTH_DAYS = 7
 TAKE_PROFIT_PCT = 0.065  # lock in gains around here rather than risk waiting for the full hold-days horizon
+TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
+# spread/slippage on smaller-cap names, since no real fill data is available.
 
 _TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -100,8 +102,10 @@ def _check_open_positions(portfolio: dict) -> None:
             still_open.append(pos)
             continue
 
-        realized_pnl = (price - pos["entry_price"]) * pos["shares"]
-        portfolio["cash"] += price * pos["shares"]
+        effective_exit_price = price * (1 - TRANSACTION_COST_PCT)
+        effective_entry_price = pos.get("effective_entry_price", pos["entry_price"])
+        realized_pnl = (effective_exit_price - effective_entry_price) * pos["shares"]
+        portfolio["cash"] += effective_exit_price * pos["shares"]
         portfolio["closed_trades"].append(
             {
                 **pos,
@@ -109,10 +113,10 @@ def _check_open_positions(portfolio: dict) -> None:
                 "exit_price": price,
                 "exit_reason": exit_reason,
                 "realized_pnl": realized_pnl,
-                "realized_pnl_pct": (price / pos["entry_price"] - 1),
+                "realized_pnl_pct": (effective_exit_price / effective_entry_price - 1),
             }
         )
-        pnl_pct = (price / pos["entry_price"] - 1) * 100
+        pnl_pct = (effective_exit_price / effective_entry_price - 1) * 100
         logger.info("SOLD %s: %s, P&L %+.2f (%+.1f%%)", pos["ticker"], exit_reason, realized_pnl, pnl_pct)
         _send_telegram(
             f"🧪 *Paper trade SOLD* {pos['ticker']} — {exit_reason}\n"
@@ -147,7 +151,8 @@ def _look_for_new_signals(portfolio: dict) -> None:
         if price is None or price <= 0:
             continue
 
-        shares = portfolio["position_size"] / price
+        effective_entry_price = price * (1 + TRANSACTION_COST_PCT)
+        shares = portfolio["position_size"] / effective_entry_price
         portfolio["cash"] -= portfolio["position_size"]
         portfolio["open_positions"].append(
             {
@@ -157,7 +162,8 @@ def _look_for_new_signals(portfolio: dict) -> None:
                 "person_name": alert.person_name,
                 "role": alert.role,
                 "entry_date": date.today().isoformat(),
-                "entry_price": price,
+                "entry_price": price,  # raw market price -- stop-loss/take-profit track this
+                "effective_entry_price": effective_entry_price,  # cost-adjusted, for real P&L
                 "shares": shares,
                 "dollar_amount": portfolio["position_size"],
                 "stop_loss_price": price * (1 + r.stop_loss_pct),
