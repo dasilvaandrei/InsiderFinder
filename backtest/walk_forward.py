@@ -43,15 +43,19 @@ def _get_strategy_rating(alert: InsiderAlert, train_buckets: list):
     return {"stop_loss_pct": stop_loss_pct, "hold_days": best["horizon_days"]}
 
 
-def _load_test_signals(conn, split_date: str) -> list:
-    return conn.execute(
-        "SELECT id, source, person_name, role, ticker, transaction_date, public_date, value, url "
-        "FROM signals WHERE public_date >= ? ORDER BY public_date",
-        (split_date,),
-    ).fetchall()
+def _load_test_signals(conn, split_date: str, test_end_date: str = None) -> list:
+    query = ("SELECT id, source, person_name, role, ticker, transaction_date, public_date, value, url "
+             "FROM signals WHERE public_date >= ?")
+    params = [split_date]
+    if test_end_date is not None:
+        query += " AND public_date < ?"
+        params.append(test_end_date)
+    query += " ORDER BY public_date"
+    return conn.execute(query, params).fetchall()
 
 
-def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, equitize_cash: bool = True) -> None:
+def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, equitize_cash: bool = True,
+                  test_end_date: str = None, verbose: bool = True) -> dict:
     conn = connect()
     spy = SpyPriceLookup(conn) if equitize_cash else None
     if split_date is None:
@@ -59,11 +63,12 @@ def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, e
 
     train_buckets = build_report(end_date=split_date)
     qualified = sum(1 for b in train_buckets if b["count"] >= 20)
-    print(f"Train period: signals before {split_date}  |  {qualified} bucket/horizon rows meet the "
-          f"20-sample minimum (these are the ONLY stats the test period is allowed to use)")
-    print()
+    if verbose:
+        print(f"Train period: signals before {split_date}  |  {qualified} bucket/horizon rows meet the "
+              f"20-sample minimum (these are the ONLY stats the test period is allowed to use)")
+        print()
 
-    test_signal_rows = _load_test_signals(conn, split_date)
+    test_signal_rows = _load_test_signals(conn, split_date, test_end_date)
 
     candidates = []
     skipped_no_rating = 0
@@ -96,13 +101,18 @@ def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, e
         candidates.append(trade)
 
     result = run_portfolio_simulation(candidates, starting_cash=starting_cash, spy=spy)
-    header = (
-        f"Test period: signals from {split_date} onward (never used to calibrate the strategy) | "
-        f"{len(test_signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
-        f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
-        f"{len(result['taken'])} actually taken ({result['skipped_no_cash']} skipped for lack of cash)"
-    )
-    print_portfolio_summary(result, header)
+    result["split_date"] = split_date
+    result["test_end_date"] = test_end_date
+    if verbose:
+        test_range = f"{split_date} onward" if test_end_date is None else f"{split_date} to {test_end_date}"
+        header = (
+            f"Test period: signals from {test_range} (never used to calibrate the strategy) | "
+            f"{len(test_signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
+            f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
+            f"{len(result['taken'])} actually taken ({result['skipped_no_cash']} skipped for lack of cash)"
+        )
+        print_portfolio_summary(result, header)
+    return result
 
 
 def main() -> None:
