@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from backtest.db import connect
 from backtest.replay_full_history import (
     STARTING_CASH,
+    SpyPriceLookup,
     _simulate_trade,
     print_portfolio_summary,
     run_portfolio_simulation,
@@ -50,8 +51,9 @@ def _load_test_signals(conn, split_date: str) -> list:
     ).fetchall()
 
 
-def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH) -> None:
+def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH, equitize_cash: bool = True) -> None:
     conn = connect()
+    spy = SpyPriceLookup(conn) if equitize_cash else None
     if split_date is None:
         split_date = _default_split_date(conn)
 
@@ -93,7 +95,7 @@ def walk_forward(split_date: str = None, starting_cash: float = STARTING_CASH) -
             continue
         candidates.append(trade)
 
-    result = run_portfolio_simulation(candidates, starting_cash=starting_cash)
+    result = run_portfolio_simulation(candidates, starting_cash=starting_cash, spy=spy)
     header = (
         f"Test period: signals from {split_date} onward (never used to calibrate the strategy) | "
         f"{len(test_signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
@@ -114,10 +116,12 @@ def main() -> None:
              "test set. Defaults to 70%% through the available SEC signal date range.",
     )
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
+    parser.add_argument("--no-equitize-cash", action="store_true",
+                         help="Let idle cash sit at 0%% instead of tracking it as SPY shares between trades")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    walk_forward(args.split_date, starting_cash=args.starting_cash)
+    walk_forward(args.split_date, starting_cash=args.starting_cash, equitize_cash=not args.no_equitize_cash)
 
 
 if __name__ == "__main__":

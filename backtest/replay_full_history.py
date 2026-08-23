@@ -1,3 +1,4 @@
+import bisect
 import logging
 from datetime import date
 
@@ -23,6 +24,25 @@ TAKE_PROFIT_PCT = 0.065  # matches the live paper-trading take-profit rule
 TRANSACTION_COST_PCT = 0.0015  # 0.15% per side (0.3% round trip) -- a conservative stand-in for
 # spread/slippage on smaller-cap names, since no real fill data is available. No brokerage
 # commission is modeled separately since most retail brokers are commission-free today.
+
+
+class SpyPriceLookup:
+    """Looks up SPY's close price as of (or the nearest trading day before) any given date --
+    lets idle cash be tracked as SPY shares instead of a static dollar figure, so capital not
+    currently in a stock pick still earns the market's return instead of 0% while it waits."""
+
+    def __init__(self, conn):
+        rows = conn.execute("SELECT date, close FROM prices WHERE ticker = 'SPY' ORDER BY date").fetchall()
+        self.dates = [date.fromisoformat(d) for d, _ in rows]
+        self.closes = [c for _, c in rows]
+
+    def price(self, d: date) -> float:
+        idx = max(bisect.bisect_right(self.dates, d) - 1, 0)
+        return self.closes[idx]
+
+    @property
+    def last_date(self) -> date:
+        return self.dates[-1]
 
 
 def _load_signals(conn) -> list:
@@ -124,16 +144,39 @@ def _simulate_trade(conn, alert: InsiderAlert, strategy: dict):
             "exit_date": last_day, "exit_price": last_price, "exit_reason": "still_open"}
 
 
-def run_portfolio_simulation(candidates: list, starting_cash: float = STARTING_CASH) -> dict:
+def run_portfolio_simulation(candidates: list, starting_cash: float = STARTING_CASH, spy: SpyPriceLookup = None) -> dict:
     """Chronological, capital-constrained trade selection: sorts candidates by entry date,
     sizes each trade at POSITION_SIZE_PCT of whatever cash is actually free at that point
     (releasing cash from positions that have already exited by then). Proportional sizing means
-    a losing streak shrinks future bet sizes rather than hitting a fixed-dollar floor. Shared by
-    the full-history replay and the walk-forward out-of-sample test so both use identical
-    portfolio mechanics."""
-    candidates = sorted(candidates, key=lambda t: t["entry_date"])
+    a losing streak shrinks future bet sizes rather than hitting a fixed-dollar floor.
 
-    cash = starting_cash
+    If `spy` is given, idle cash is equitized: tracked as SPY shares rather than a static dollar
+    figure, so capital sitting out between trades earns SPY's return instead of 0% -- otherwise
+    a strategy whose median hold is ~1 day can lose to buy-and-hold SPY on cash-drag alone, even
+    if most individual trades beat SPY (confirmed on this dataset: median 1-day holds meant most
+    capital sat idle earning nothing, and the un-equitized portfolio trailed SPY in every window
+    tested). Without `spy`, idle cash earns nothing, matching the original behavior.
+
+    Shared by the full-history replay and the walk-forward out-of-sample test so both use
+    identical portfolio mechanics."""
+    candidates = sorted(candidates, key=lambda t: t["entry_date"])
+    equitize = spy is not None and len(candidates) > 0
+
+    if equitize:
+        cash_shares = starting_cash / spy.price(candidates[0]["entry_date"])
+    else:
+        cash = starting_cash
+
+    def _cash_value(as_of: date) -> float:
+        return cash_shares * spy.price(as_of) if equitize else cash
+
+    def _release_cash(amount: float, as_of: date) -> None:
+        nonlocal cash, cash_shares
+        if equitize:
+            cash_shares += amount / spy.price(as_of)
+        else:
+            cash += amount
+
     pending_exits = []  # (exit_date, dollars_freed)
     taken = []
     skipped_no_cash = 0
@@ -142,17 +185,21 @@ def run_portfolio_simulation(candidates: list, starting_cash: float = STARTING_C
         still_pending = []
         for exit_date, amount in pending_exits:
             if exit_date <= t["entry_date"]:
-                cash += amount
+                _release_cash(amount, exit_date)
             else:
                 still_pending.append((exit_date, amount))
         pending_exits = still_pending
 
-        if cash < _MIN_CASH_TO_TRADE:
+        current_cash = _cash_value(t["entry_date"])
+        if current_cash < _MIN_CASH_TO_TRADE:
             skipped_no_cash += 1
             continue
 
-        position_size = min(cash * POSITION_SIZE_PCT, MAX_POSITION_SIZE)
-        cash -= position_size
+        position_size = min(current_cash * POSITION_SIZE_PCT, MAX_POSITION_SIZE)
+        if equitize:
+            cash_shares -= position_size / spy.price(t["entry_date"])
+        else:
+            cash -= position_size
         # Entry/exit thresholds (stop-loss, take-profit, hold-days) are decided off the raw
         # market price in _simulate_trade(); the cost only affects the price actually paid/
         # received, i.e. how many shares this position size buys and how much the sale nets.
@@ -170,12 +217,14 @@ def run_portfolio_simulation(candidates: list, starting_cash: float = STARTING_C
         })
 
     for exit_date, amount in pending_exits:
-        cash += amount
+        _release_cash(amount, exit_date)
+
+    final_value = _cash_value(spy.last_date) if equitize else cash
+    total_pnl = final_value - starting_cash
 
     closed = [t for t in taken if t["exit_reason"] != "still_open"]
     open_ = [t for t in taken if t["exit_reason"] == "still_open"]
-    total_pnl = sum(t["pnl"] for t in taken)
-    final_value = starting_cash + total_pnl
+    stock_picking_pnl = sum(t["pnl"] for t in taken)
 
     reasons = {}
     for t in taken:
@@ -186,6 +235,8 @@ def run_portfolio_simulation(candidates: list, starting_cash: float = STARTING_C
         "closed": closed,
         "open": open_,
         "total_pnl": total_pnl,
+        "stock_picking_pnl": stock_picking_pnl,
+        "equitized_cash": equitize,
         "final_value": final_value,
         "starting_cash": starting_cash,
         "skipped_no_cash": skipped_no_cash,
@@ -206,6 +257,8 @@ def print_portfolio_summary(result: dict, header_line: str) -> None:
         )
     print()
     print(f"Closed trades: {len(result['closed'])}  |  Still open (mark-to-market): {len(result['open'])}")
+    if result.get("equitized_cash"):
+        print(f"Stock-picking P&L only (excludes idle-cash SPY gains): ${result['stock_picking_pnl']:+,.2f}")
     print(f"Total P&L: ${result['total_pnl']:+,.2f}")
     print(
         f"Final value: ${result['final_value']:,.2f} (started ${result['starting_cash']:,.2f}, "
@@ -213,9 +266,10 @@ def print_portfolio_summary(result: dict, header_line: str) -> None:
     )
 
 
-def replay(starting_cash: float = STARTING_CASH) -> None:
+def replay(starting_cash: float = STARTING_CASH, equitize_cash: bool = True) -> None:
     conn = connect()
     signal_rows = _load_signals(conn)
+    spy = SpyPriceLookup(conn) if equitize_cash else None
 
     candidates = []
     skipped_no_rating = 0
@@ -247,7 +301,7 @@ def replay(starting_cash: float = STARTING_CASH) -> None:
             continue
         candidates.append(trade)
 
-    result = run_portfolio_simulation(candidates, starting_cash=starting_cash)
+    result = run_portfolio_simulation(candidates, starting_cash=starting_cash, spy=spy)
     header = (
         f"{len(signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
         f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
@@ -261,10 +315,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Replay the full cached signal history through the live strategy")
     parser.add_argument("--starting-cash", type=float, default=STARTING_CASH, help="Starting portfolio cash")
+    parser.add_argument("--no-equitize-cash", action="store_true",
+                         help="Let idle cash sit at 0%% instead of tracking it as SPY shares between trades")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    replay(starting_cash=args.starting_cash)
+    replay(starting_cash=args.starting_cash, equitize_cash=not args.no_equitize_cash)
 
 
 if __name__ == "__main__":
