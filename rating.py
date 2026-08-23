@@ -42,12 +42,15 @@ def _load_buckets() -> list:
     return _cache
 
 
-def _bucket_rows(source: str, role: str, value: float) -> list:
+def _bucket_rows(source: str, role: str, value: float, buckets: Optional[list] = None) -> list:
+    """`buckets` defaults to the live, globally-cached ratings.json contents; callers doing
+    walk-forward validation can pass an alternate (e.g. train-period-only) bucket list instead."""
     role_bucket = _role_bucket(source, role)
     value_bucket = _value_bucket(value or 0)
+    source_buckets = buckets if buckets is not None else _load_buckets()
     return [
         row
-        for row in _load_buckets()
+        for row in source_buckets
         if row["source"] == source and row["role_bucket"] == role_bucket and row["value_bucket"] == value_bucket
     ]
 

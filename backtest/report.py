@@ -48,12 +48,24 @@ def _percentile(values: list, pct: float) -> float:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
 
 
-def build_report() -> list:
+def build_report(start_date: str = None, end_date: str = None) -> list:
+    """Aggregates backtest_results into (source, role_bucket, value_bucket, horizon_days)
+    stats. `start_date`/`end_date` (ISO strings, inclusive/exclusive respectively) restrict
+    which signals' results feed the calibration -- used for walk-forward validation, where
+    the stats used to rate a trade must come only from signals disclosed before it."""
     conn = db.connect()
-    rows = conn.execute(
-        """SELECT s.source, s.role, s.value, r.horizon_days, r.excess_return, r.stock_return
-           FROM backtest_results r JOIN signals s ON s.id = r.signal_id"""
-    ).fetchall()
+    query = """SELECT s.source, s.role, s.value, r.horizon_days, r.excess_return, r.stock_return
+               FROM backtest_results r JOIN signals s ON s.id = r.signal_id"""
+    conditions, params = [], []
+    if start_date is not None:
+        conditions.append("s.public_date >= ?")
+        params.append(start_date)
+    if end_date is not None:
+        conditions.append("s.public_date < ?")
+        params.append(end_date)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    rows = conn.execute(query, params).fetchall()
     conn.close()
 
     excess_groups = defaultdict(list)

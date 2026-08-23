@@ -86,41 +86,13 @@ def _simulate_trade(conn, alert: InsiderAlert, strategy: dict):
             "exit_date": last_day, "exit_price": last_price, "exit_reason": "still_open"}
 
 
-def replay() -> None:
-    conn = connect()
-    signal_rows = _load_signals(conn)
-
-    candidates = []
-    skipped_no_rating = 0
-    skipped_no_price = 0
-    for sid, source, person_name, role, ticker, transaction_date, public_date, value, url in signal_rows:
-        if not ticker or not public_date:
-            continue
-        alert = InsiderAlert(
-            source=source,
-            person_name=person_name or "",
-            role=role or "",
-            entity=ticker,
-            transaction_type="Open Market Purchase",
-            transaction_date=transaction_date,
-            value_low=value or 0.0,
-            value_display=f"${value:,.0f}" if value else "",
-            url=url or "",
-            ticker=ticker,
-            public_date=public_date,
-        )
-        strategy = _get_strategy_rating(alert)
-        if strategy is None or strategy["hold_days"] is None or strategy["stop_loss_pct"] is None:
-            skipped_no_rating += 1
-            continue
-
-        trade = _simulate_trade(conn, alert, strategy)
-        if trade is None:
-            skipped_no_price += 1
-            continue
-        candidates.append(trade)
-
-    candidates.sort(key=lambda t: t["entry_date"])
+def run_portfolio_simulation(candidates: list) -> dict:
+    """Chronological, capital-constrained trade selection: sorts candidates by entry date,
+    only takes a trade if $400 of cash is actually free at that point (releasing cash from
+    positions that have already exited by then), and skips it otherwise. Shared by the full-
+    history replay and the walk-forward out-of-sample test so both use identical portfolio
+    mechanics."""
+    candidates = sorted(candidates, key=lambda t: t["entry_date"])
 
     cash = STARTING_CASH
     pending_exits = []  # (exit_date, dollars_freed)
@@ -158,22 +130,78 @@ def replay() -> None:
     for t in taken:
         reasons[t["exit_reason"]] = reasons.get(t["exit_reason"], 0) + 1
 
-    print(f"{len(signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
-          f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
-          f"{len(taken)} actually taken ({skipped_no_cash} skipped for lack of cash)")
-    print(f"Exit reasons: {reasons}")
+    return {
+        "taken": taken,
+        "closed": closed,
+        "open": open_,
+        "total_pnl": total_pnl,
+        "final_value": final_value,
+        "skipped_no_cash": skipped_no_cash,
+        "reasons": reasons,
+    }
+
+
+def print_portfolio_summary(result: dict, header_line: str) -> None:
+    print(header_line)
+    print(f"Exit reasons: {result['reasons']}")
     print()
     print(f"{'Ticker':8} {'Role':22} {'Entry':11} {'Exit':11} {'Reason':16} {'P&L':>9} {'P&L%':>8}")
-    for t in sorted(taken, key=lambda x: x["entry_date"]):
+    for t in sorted(result["taken"], key=lambda x: x["entry_date"]):
         a = t["alert"]
         print(
             f"{a.ticker:8} {a.role[:22]:22} {t['entry_date'].isoformat():11} {t['exit_date'].isoformat():11} "
             f"{t['exit_reason']:16} {t['pnl']:>+8.2f} {t['pnl_pct']*100:>+7.1f}%"
         )
     print()
-    print(f"Closed trades: {len(closed)}  |  Still open (mark-to-market): {len(open_)}")
-    print(f"Total P&L: ${total_pnl:+,.2f}")
-    print(f"Final value: ${final_value:,.2f} (started ${STARTING_CASH:,.2f}, {(final_value/STARTING_CASH-1)*100:+.2f}%)")
+    print(f"Closed trades: {len(result['closed'])}  |  Still open (mark-to-market): {len(result['open'])}")
+    print(f"Total P&L: ${result['total_pnl']:+,.2f}")
+    print(
+        f"Final value: ${result['final_value']:,.2f} (started ${STARTING_CASH:,.2f}, "
+        f"{(result['final_value']/STARTING_CASH-1)*100:+.2f}%)"
+    )
+
+
+def replay() -> None:
+    conn = connect()
+    signal_rows = _load_signals(conn)
+
+    candidates = []
+    skipped_no_rating = 0
+    skipped_no_price = 0
+    for sid, source, person_name, role, ticker, transaction_date, public_date, value, url in signal_rows:
+        if not ticker or not public_date:
+            continue
+        alert = InsiderAlert(
+            source=source,
+            person_name=person_name or "",
+            role=role or "",
+            entity=ticker,
+            transaction_type="Open Market Purchase",
+            transaction_date=transaction_date,
+            value_low=value or 0.0,
+            value_display=f"${value:,.0f}" if value else "",
+            url=url or "",
+            ticker=ticker,
+            public_date=public_date,
+        )
+        strategy = _get_strategy_rating(alert)
+        if strategy is None or strategy["hold_days"] is None or strategy["stop_loss_pct"] is None:
+            skipped_no_rating += 1
+            continue
+
+        trade = _simulate_trade(conn, alert, strategy)
+        if trade is None:
+            skipped_no_price += 1
+            continue
+        candidates.append(trade)
+
+    result = run_portfolio_simulation(candidates)
+    header = (
+        f"{len(signal_rows)} total signals | {skipped_no_rating} suppressed/no-rating | "
+        f"{skipped_no_price} skipped (no price data) | {len(candidates)} qualifying trades | "
+        f"{len(result['taken'])} actually taken ({result['skipped_no_cash']} skipped for lack of cash)"
+    )
+    print_portfolio_summary(result, header)
 
 
 def main() -> None:
